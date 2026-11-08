@@ -1,0 +1,1968 @@
+﻿DATA_DIR <- "D:/论文数据处理/新lasso+boruta"
+OUTPUT_DIR <- "D:/论文数据处理/新lasso+boruta/单次插补有crrt"
+if(dir.exists(OUTPUT_DIR) && length(list.files(OUTPUT_DIR,all.files=FALSE))) {
+  OUTPUT_DIR <- file.path(OUTPUT_DIR,paste0("Run_",format(Sys.time(),"%Y%m%d_%H%M%S")))
+  if(dir.exists(OUTPUT_DIR)) stop("输出目录已存在，请修改OUTPUT_DIR")
+}
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+OUTPUT_DIR <- normalizePath(OUTPUT_DIR, winslash = "/", mustWork = TRUE)
+setwd(OUTPUT_DIR)
+options(digits = 7)
+required_packages <- c("caret", "pROC", "ggplot2", "lattice", "tibble", "rlang",
+                       "cvms", "rmda", "kernlab", "gbm", "kknn", "nnet", "xgboost",
+                       "adabag", "lightgbm", "catboost", "kernelshap", "shapviz", "Boruta", "glmnet",
+                       "fru", "VennDiagram")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace,
+                                              logical(1), quietly = TRUE)]
+if (length(missing_packages)) stop("请先安装缺失的包: ", paste(missing_packages, collapse = ", "))
+for (pkg in required_packages) suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+optional_plot_packages <- c("ggimage", "rsvg")
+if (!all(vapply(optional_plot_packages, requireNamespace, logical(1), quietly=TRUE)))
+  warning("可选ggimage/rsvg包缺失时，cvms不绘制箭头和零值阴影；不影响数值。原绘图开关仍保留。")
+RUN_SHAP <- TRUE
+SHAP_SELECTED_MODEL_ONLY <- TRUE
+SHAP_TARGET_PROBABILITY <- 0.70
+if (!is.numeric(SHAP_TARGET_PROBABILITY) || length(SHAP_TARGET_PROBABILITY) != 1L ||
+    !is.finite(SHAP_TARGET_PROBABILITY) || SHAP_TARGET_PROBABILITY <= 0 || SHAP_TARGET_PROBABILITY >= 1)
+  stop("SHAP_TARGET_PROBABILITY必须是0和1之间的单个数值。")
+var=c("Result","MV","SA","AKI","Temperature","RBC","SAPSII","VP","AHT","LC","GCS","RR")
+RAW_DATA_DIR <- "D:/论文数据处理/新lasso+boruta"
+OUTER_FOLDS <- 5L
+INNER_FOLDS <- 5L
+LASSO_FOLDS <- 5L
+LASSO_SELECTION_RULE <- "lambda.min"
+BORUTA_MAX_RUNS <- 200L
+MISSING_LIMIT <- 0.30
+SPLIT_SEED <- 456789L
+CV_SEED <- 52L
+PRIMARY_MODEL_CANDIDATES <- c("Logistic","SVM","GBM","KNN","NeuralNetwork",
+                              "Xgboost","Adaboost","LightGBM","CatBoost")
+SHAP_EXPLAINABLE_MODELS <- PRIMARY_MODEL_CANDIDATES
+PRIMARY_MODEL_EXCLUSIONS <- character(0)
+MODEL_SELECTION_RULE <- paste(
+  "Highest mean inner-CV AUC among all nine candidate models;",
+  "exact ties are resolved by deterministic model-name ordering;",
+  "no internal-test or external-validation metric is used for selection")
+MODEL_SELECTION_TIMING <- "Revision-stage post hoc AUC-only rule after review of existing results; not originally prespecified"
+SMOKE_TEST <- FALSE
+REPEAT_POLICY <- "first_available"
+if (REPEAT_POLICY != "first_available") stop("请先核对原文首次入院标准；本版只支持每位患者最早的可用记录。")
+USER_SELECTED_FEATURES <- setdiff(var, "Result")
+CANDIDATE_FEATURES <- c("CRRT","MV","SA","VP","AHT","AKI","HTN","LC","CKD",
+                        "CA","DM","HF","Gender","SAPSII","GCS","Age","Weight","HR","NIBPS","NIBPD",
+                        "RR","SPO2","Temperature","WBC","PLT","INR","PT","PTT","Glucose","Sodium",
+                        "Potassium","Chloride","Magnesium","Creatinine","Urea_nitrogen",
+                        "HB","RBC","HCT","MCV")
+BINARY_FEATURES <- c("CRRT","MV","SA","VP","AHT","AKI","HTN","LC","CKD","CA","DM","HF","Gender")
+r6_read <- function(file) {
+  d=read.csv(file,check.names=FALSE,na.strings=c("","NA","NaN","NULL"),
+             strip.white=TRUE,fileEncoding="GB18030")
+  if("HGB" %in% names(d) && !"HB" %in% names(d)) names(d)[names(d)=="HGB"]="HB"
+  if(!all(c("Result",CANDIDATE_FEATURES) %in% names(d)))
+    stop(file,": 缺候选变量 ",paste(setdiff(c("Result",CANDIDATE_FEATURES),names(d)),collapse=","))
+  for(nm in c("Result",CANDIDATE_FEATURES)) {
+    z=suppressWarnings(as.numeric(as.character(d[[nm]])))
+    if(any(is.na(z) & !is.na(d[[nm]]))) stop(file,": 非数值内容：",nm)
+    if(any(is.infinite(z))) stop(file,": 无穷值：",nm)
+    d[[nm]]=z
+  }
+  if(anyNA(d$Result) || !all(d$Result %in% 0:1)) stop("结局缺失或不是0/1")
+  for(nm in BINARY_FEATURES) if(!all(na.omit(d[[nm]]) %in% 0:1)) stop(nm,"不是0/1编码")
+  d$.source_row=seq_len(nrow(d))
+  d$Result=factor(d$Result,levels=0:1,labels=c("No","Yes"))
+  d
+}
+r6_cohort <- function(file,cohort,id,stay,timefile=NULL) {
+  d=r6_read(file)
+  has_ids=all(c(id,stay) %in% names(d)) && !anyNA(d[[id]]) && !anyNA(d[[stay]])
+  if(has_ids) {
+    if(anyDuplicated(d[[stay]])) stop(cohort,": ICU记录ID重复")
+    d$.patient=as.character(d[[id]]); d$.stay=as.character(d[[stay]])
+    has_time=!is.null(timefile) && file.exists(timefile)
+    if(has_time) {
+      tt=read.csv(timefile,check.names=FALSE,stringsAsFactors=FALSE)
+      if(!all(c(stay,"icu_intime") %in% names(tt)))
+        stop(cohort,": 住院时间表缺少 ",stay," 或 icu_intime")
+      ii=match(d$.stay,as.character(tt[[stay]]))
+      if(anyNA(ii)) stop(cohort,": 住院时间表匹配失败")
+      d$.admission=as.POSIXct(tt$icu_intime[ii],format="%d/%m/%Y %H:%M:%S",tz="UTC")
+      if(anyNA(d$.admission)) stop(cohort,": 入ICU时间不能按日/月/年读取")
+    } else {
+      d$.admission=as.POSIXct(rep(0,nrow(d)),origin="1970-01-01",tz="UTC")
+      warning(cohort,": 未提供可用住院时间表；同一患者如有多条记录，将按ICU记录ID排序保留第一条。")
+    }
+    ord=order(d$.patient,d$.admission,d$.stay)
+    keep=sort(ord[!duplicated(d$.patient[ord])])
+    rule=if(has_time) "Earliest available eligible record per patient using supplied ICU admission time" else
+      "Earliest input record per patient; ICU admission-time audit unavailable"
+  } else {
+    warning(cohort,": 建模CSV缺少 ",id,"/",stay,
+            "；无法在本代码内核验重复患者或首次ICU记录。假定上游提取已完成去重，并保留全部行。")
+    d$.patient=paste0(cohort,"_row_",d$.source_row)
+    d$.stay=d$.patient
+    d$.admission=as.POSIXct(rep(NA_real_,nrow(d)),origin="1970-01-01",tz="UTC")
+    keep=seq_len(nrow(d))
+    rule="All supplied rows retained; patient/stay identifiers unavailable, so upstream deduplication cannot be audited"
+  }
+  audit=data.frame(Cohort=cohort,Source_row=d$.source_row,Patient_ID=d$.patient,
+                   Stay_ID=d$.stay,Admission_time=as.character(d$.admission),Retained=seq_len(nrow(d)) %in% keep,
+                   Rule=rule)
+  list(data=d[keep,,drop=FALSE],audit=audit)
+}
+r6_imputer_fit <- function(x) {
+  missing=vapply(x,function(z)mean(is.na(z)),numeric(1))
+  keep=names(x)[missing<=MISSING_LIMIT & missing<1]
+  fill=vapply(keep,function(nm) {
+    z=na.omit(x[[nm]])
+    if(nm %in% BINARY_FEATURES) as.numeric(names(sort(table(z),decreasing=TRUE))[1]) else median(z)
+  },numeric(1))
+  obj=list(keep=keep,fill=fill,missing=missing)
+  a=r6_imputer_apply(obj,x)
+  nonconstant=vapply(a,function(z)length(unique(z))>1L,logical(1))
+  obj$keep=keep[nonconstant];obj$fill=fill[obj$keep]
+  if(length(obj$keep)<2L) stop("训练部分可用变量少于2项")
+  obj
+}
+r6_imputer_apply <- function(obj,x) {
+  x=x[,obj$keep,drop=FALSE]
+  for(nm in obj$keep) x[[nm]][is.na(x[[nm]])]=obj$fill[[nm]]
+  if(anyNA(x)) stop("插补后仍缺失")
+  x
+}
+r6_folds <- function(d,k,seed) {
+  if(anyDuplicated(d$.patient)) stop("分折前必须先处理重复患者")
+  if(min(table(d$Result))<k) stop("少数类别例数少于折数")
+  set.seed(seed); caret::createFolds(d$Result,k=k,returnTrain=FALSE)
+}
+r6_auc <- function(y,p) {
+  if(anyNA(p) || any(!is.finite(p)) || any(p<0 | p>1)) stop("预测概率无效")
+  as.numeric(pROC::auc(pROC::roc(y,p,levels=c("No","Yes"),direction="<",quiet=TRUE)))
+}
+r6_lasso_path <- function(x,y,ratios) {
+  pilot=glmnet::glmnet(as.matrix(x),as.integer(y=="Yes"),family="binomial",alpha=1,
+                       standardize=TRUE,nlambda=20)
+  mx=pilot$lambda[1]
+  fit=glmnet::glmnet(as.matrix(x),as.integer(y=="Yes"),family="binomial",alpha=1,
+                     standardize=TRUE,lambda=mx*ratios)
+  list(fit=fit,lambda=mx*ratios,lambda_max=mx)
+}
+r6_preprocess_fit <- function(d,seed,tag) {
+  if(!identical(LASSO_SELECTION_RULE,"lambda.min"))
+    stop("本脚本只支持lambda.min；不要把配置标签与实际选择规则改成不一致。")
+  x=d[,CANDIDATE_FEATURES,drop=FALSE]
+  ratios=exp(seq(log(1),log(0.0001),length.out=60L))
+  lf=r6_folds(d,LASSO_FOLDS,seed+1L)
+  losses=matrix(NA_real_,length(lf),length(ratios))
+  for(j in seq_along(lf)) {
+    va=lf[[j]];tr=setdiff(seq_len(nrow(d)),va)
+    ip=r6_imputer_fit(x[tr,,drop=FALSE])
+    a=r6_imputer_apply(ip,x[tr,,drop=FALSE]);b=r6_imputer_apply(ip,x[va,,drop=FALSE])
+    zz=r6_lasso_path(a,d$Result[tr],ratios)
+    p=as.matrix(predict(zz$fit,newx=as.matrix(b),s=zz$lambda,type="response"))
+    p=pmin(pmax(p,1e-15),1-1e-15);y=as.integer(d$Result[va]=="Yes")
+    losses[j,]=colMeans(-2*(y*log(p)+(1-y)*log1p(-p)))
+  }
+  mu=colMeans(losses);se=apply(losses,2,sd)/sqrt(nrow(losses));best=which.min(mu)
+  chosen=best
+  reference_1se=which(mu<=mu[best]+se[best])[1]
+  ip=r6_imputer_fit(x);a=r6_imputer_apply(ip,x)
+  lp=r6_lasso_path(a,d$Result,ratios)
+  co=as.matrix(coef(lp$fit,s=lp$lambda[chosen]))
+  lasso=setdiff(rownames(co)[co[,1]!=0],"(Intercept)")
+  set.seed(seed)
+  bo=Boruta::Boruta(x=a,y=d$Result,maxRuns=BORUTA_MAX_RUNS,doTrace=0,
+                    holdHistory=TRUE,num.threads=2)
+  if(any(bo$finalDecision=="Tentative")) bo=Boruta::TentativeRoughFix(bo)
+  boruta=names(bo$finalDecision)[bo$finalDecision=="Confirmed"]
+  features=names(a)[names(a) %in% intersect(boruta,lasso)]
+  if(!length(features)) stop(tag,": Boruta与LASSO交集为空，停止并核对；不会静默改为并集或固定11变量")
+  obj=list(imputer=ip,features=features,boruta=boruta,lasso=lasso,
+           boruta_decisions=bo$finalDecision,lambda_ratio=ratios[chosen],lambda=lp$lambda[chosen],
+           lasso_selection_rule=LASSO_SELECTION_RULE,lambda_min_index=best,lambda_1se_reference_index=reference_1se,
+           lasso_cv=data.frame(Ratio=ratios,Mean_deviance=mu,SE=se,Selected=seq_along(ratios)==chosen),
+           seed=seed,tag=tag,training_source_rows=d$.source_row,training_patients=d$.patient)
+  saveRDS(obj,file.path("Pipeline_audit",paste0(tag,"_preprocess.rds")))
+  write.csv(obj$lasso_cv,file.path("Pipeline_audit",paste0(tag,"_LASSO_CV.csv")),row.names=FALSE)
+  write.csv(data.frame(Stage=tag,Feature=CANDIDATE_FEATURES,
+                       Missing_fraction=ip$missing[CANDIDATE_FEATURES],
+                       Available=CANDIDATE_FEATURES %in% ip$keep,Boruta=CANDIDATE_FEATURES %in% boruta,
+                       LASSO=CANDIDATE_FEATURES %in% lasso,Intersection=CANDIDATE_FEATURES %in% features),
+            file.path("Pipeline_audit",paste0(tag,"_features.csv")),row.names=FALSE)
+  obj
+}
+r6_preprocess_apply <- function(obj,d) {
+  x=r6_imputer_apply(obj$imputer,d[,CANDIDATE_FEATURES,drop=FALSE])
+  data.frame(Result=d$Result,x[,obj$features,drop=FALSE],check.names=FALSE)
+}
+r6_grids <- list(
+  Logistic=data.frame(parameter="none"),
+  SVM=expand.grid(sigma=c(.01,.1,.5),C=c(.1,1,10)),
+  GBM=expand.grid(n.trees=c(100L,300L),interaction.depth=c(1L,3L),shrinkage=c(.03,.1),n.minobsinnode=10L),
+  KNN=expand.grid(kmax=c(5L,11L,21L),distance=c(1,2),kernel="optimal"),
+  NeuralNetwork=expand.grid(size=c(3L,5L,9L),decay=c(.01,.1,1)),
+  Xgboost=expand.grid(nrounds=c(100L,300L),max_depth=c(2L,4L),eta=c(.03,.1),gamma=0,
+                      colsample_bytree=.8,min_child_weight=5,subsample=.8),
+  Adaboost=expand.grid(mfinal=c(50L,150L),maxdepth=c(1L,2L),coeflearn="Zhu"),
+  LightGBM=expand.grid(nrounds=c(100L,300L),num_leaves=c(7L,15L),learning_rate=c(.03,.1),min_data_in_leaf=20L),
+  CatBoost=expand.grid(iterations=c(200L,500L),depth=c(3L,5L),learning_rate=c(.03,.1),l2_leaf_reg=3)
+)
+r6_methods=c(Logistic="glm",SVM="svmRadial",GBM="gbm",KNN="kknn",NeuralNetwork="nnet",
+             Xgboost="xgbTree",Adaboost="AdaBoost.M1",LightGBM="LightGBM",CatBoost="CatBoost")
+stopifnot(identical(names(r6_methods), PRIMARY_MODEL_CANDIDATES),
+          identical(names(r6_grids), PRIMARY_MODEL_CANDIDATES),
+          setequal(SHAP_EXPLAINABLE_MODELS, PRIMARY_MODEL_CANDIDATES),
+          isTRUE(SHAP_SELECTED_MODEL_ONLY))
+r6_lgb_params <- function(g,seed) list(objective="binary",metric="auc",verbosity=-1L,
+                                       num_leaves=as.integer(g$num_leaves),min_data_in_leaf=as.integer(g$min_data_in_leaf),
+                                       learning_rate=g$learning_rate,num_threads=2L,force_col_wise=TRUE,deterministic=TRUE,
+                                       seed=as.integer(seed),feature_fraction_seed=as.integer(seed),bagging_seed=as.integer(seed))
+r6_cat_params <- function(g,seed) list(iterations=as.integer(g$iterations),depth=as.integer(g$depth),
+                                       learning_rate=g$learning_rate,l2_leaf_reg=g$l2_leaf_reg,loss_function="Logloss",eval_metric="AUC",
+                                       random_seed=as.integer(seed),thread_count=2L,use_best_model=FALSE,allow_writing_files=FALSE,
+                                       logging_level="Silent",border_count=20L)
+r6_fit <- function(nm,d,g,seed) {
+  set.seed(seed)
+  if(nm=="LightGBM") return(lightgbm::lgb.train(r6_lgb_params(g,seed),
+                                                lightgbm::lgb.Dataset(as.matrix(d[,-1,drop=FALSE]),label=as.integer(d$Result=="Yes")),nrounds=as.integer(g$nrounds)))
+  if(nm=="CatBoost") return(catboost::catboost.train(catboost::catboost.load_pool(
+    as.matrix(d[,-1,drop=FALSE]),label=as.integer(d$Result=="Yes")),NULL,r6_cat_params(g,seed)))
+  args=list(Result~.,data=d,method=unname(r6_methods[nm]),tuneGrid=g,
+            trControl=caret::trainControl(method="none",classProbs=TRUE,allowParallel=FALSE))
+  if(nm %in% c("SVM","KNN","NeuralNetwork")) args$preProcess=c("center","scale")
+  if(nm=="Logistic") {args$tuneGrid=NULL;args$family=binomial()}
+  if(nm=="GBM") args$verbose=FALSE
+  if(nm=="NeuralNetwork") {args$trace=FALSE;args$maxit=500L;args$MaxNWts=10000L}
+  if(nm=="Xgboost") {args$nthread=2L;args$verbose=0L}
+  do.call(caret::train,args)
+}
+r6_predict <- function(nm,fit,d) {
+  if(nm=="LightGBM") return(as.numeric(predict(fit,as.matrix(d[,-1,drop=FALSE]))))
+  if(nm=="CatBoost") return(as.numeric(catboost::catboost.predict(fit,
+                                                                  catboost::catboost.load_pool(as.matrix(d[,-1,drop=FALSE])),prediction_type="Probability")))
+  as.numeric(predict(fit,newdata=d,type="prob")$Yes)
+}
+r6_params_text <- function(g) paste(paste(names(g),
+                                          vapply(g,function(z) paste(as.character(z),collapse="|"),character(1)),sep="="),collapse="; ")
+r6_pick <- function(s) {
+  required <- c("Model", "Mean_CV_AUC", "SE_CV_AUC")
+  if (!is.data.frame(s) || !all(required %in% names(s)) || !nrow(s))
+    stop("模型选择输入为空或缺少Model/Mean_CV_AUC/SE_CV_AUC。")
+  if (anyNA(s$Model) || any(!nzchar(as.character(s$Model))) || anyDuplicated(s$Model))
+    stop("每个模型必须有且仅有一组已由内层CV选定的参数。")
+  if (!is.numeric(s$Mean_CV_AUC) || any(!is.finite(s$Mean_CV_AUC)) ||
+      any(s$Mean_CV_AUC < 0 | s$Mean_CV_AUC > 1) ||
+      !is.numeric(s$SE_CV_AUC) || any(!is.finite(s$SE_CV_AUC)) || any(s$SE_CV_AUC < 0))
+    stop("模型CV指标无效；请核对训练日志，不会静默忽略失败模型。")
+  s$Model <- as.character(s$Model)
+  if (!setequal(s$Model, PRIMARY_MODEL_CANDIDATES))
+    stop("模型选择汇总必须完整包含预先登记的九个候选模型。")
+  s <- s[order(-s$Mean_CV_AUC, s$Model, method = "radix"), , drop = FALSE]
+  s$Overall_AUC_rank <- seq_len(nrow(s))
+  s$SHAP_explainable <- s$Model %in% SHAP_EXPLAINABLE_MODELS
+  s$Eligible_for_primary <- s$Model %in% PRIMARY_MODEL_CANDIDATES &
+    !s$Model %in% PRIMARY_MODEL_EXCLUSIONS
+  s$Primary_rank <- NA_integer_
+  eligible <- which(s$Eligible_for_primary)
+  if (!length(eligible)) stop("没有满足预先登记资格的候选模型。")
+  s$Primary_rank[eligible] <- seq_along(eligible)
+  selected <- s$Model[eligible[1L]]
+  overall_leader <- s$Model[1L]
+  fallback_used <- FALSE
+  s$Selected_by_rule <- s$Model == selected
+  s$SHAP_used_for_selection <- FALSE
+  s$Primary_role <- ifelse(s$Selected_by_rule, "Selected primary model",
+                           ifelse(s$Eligible_for_primary, "Eligible candidate comparator",
+                                  "Not eligible for primary selection"))
+  s$Selection_rule <- MODEL_SELECTION_RULE
+  s$Selection_timing <- MODEL_SELECTION_TIMING
+  stopifnot(selected %in% PRIMARY_MODEL_CANDIDATES,
+            identical(selected,overall_leader),
+            selected %in% SHAP_EXPLAINABLE_MODELS,
+            !selected %in% PRIMARY_MODEL_EXCLUSIONS,
+            sum(s$Selected_by_rule) == 1L)
+  excluded <- setdiff(PRIMARY_MODEL_CANDIDATES, s$Model[s$Eligible_for_primary])
+  list(model = selected, leader = selected, overall_leader = overall_leader,
+       selected_mean_auc = s$Mean_CV_AUC[eligible[1L]],
+       excluded = if(length(excluded)) paste(excluded, collapse = ";") else "None",
+       fallback_used = fallback_used,
+       rule = MODEL_SELECTION_RULE, audit = s)
+}
+r6_search <- function(d,seed,tag) {
+  folds=r6_folds(d,INNER_FOLDS,seed);sc=list();count=0L
+  saveRDS(lapply(folds,function(i)d$.source_row[i]),file.path("Pipeline_audit",paste0(tag,"_inner_validation_rows.rds")))
+  for(j in seq_along(folds)) {
+    va=folds[[j]];tr=setdiff(seq_len(nrow(d)),va)
+    stopifnot(!length(intersect(d$.patient[tr],d$.patient[va])))
+    stage=paste0(tag,"_Inner",j)
+    pp=r6_preprocess_fit(d[tr,,drop=FALSE],seed+100L*j,stage)
+    a=r6_preprocess_apply(pp,d[tr,,drop=FALSE]);b=r6_preprocess_apply(pp,d[va,,drop=FALSE])
+    for(nm in names(r6_grids)) for(q in seq_len(nrow(r6_grids[[nm]]))) {
+      g=r6_grids[[nm]][q,,drop=FALSE]
+      fit=r6_fit(nm,a,g,seed+1000L*j+q)
+      p=r6_predict(nm,fit,b);count=count+1L
+      sc[[count]]=data.frame(Stage=tag,Fold=j,Model=nm,Config=q,AUC=r6_auc(b$Result,p))
+    }
+    message(tag,"：内层第",j,"/",length(folds),"折完成；交集",length(pp$features),"项")
+  }
+  scores=do.call(rbind,sc)
+  summary=do.call(rbind,lapply(split(scores,list(scores$Model,scores$Config),drop=TRUE),function(z)
+    data.frame(Model=z$Model[1],Config=z$Config[1],Mean_CV_AUC=mean(z$AUC),
+               SD_CV_AUC=sd(z$AUC),SE_CV_AUC=sd(z$AUC)/sqrt(nrow(z)),Resamples=nrow(z))))
+  summary=summary[order(summary$Model,-summary$Mean_CV_AUC,summary$Config),]
+  best=summary[!duplicated(summary$Model),];pick=r6_pick(best)
+  write.csv(scores,file.path("Pipeline_audit",paste0(tag,"_all_grid_fold_AUC.csv")),row.names=FALSE)
+  write.csv(summary,file.path("Pipeline_audit",paste0(tag,"_grid_summary.csv")),row.names=FALSE)
+  write.csv(pick$audit,file.path("Pipeline_audit",paste0(tag,"_primary_model_selection.csv")),row.names=FALSE)
+  list(best=best,selection=pick,scores=scores)
+}
+dir.create("Pipeline_audit",showWarnings=FALSE)
+c4=r6_cohort(file.path(RAW_DATA_DIR,"mimic4.csv"),"MIMIC-IV","subject_id","stay_id",
+             file.path(RAW_DATA_DIR,"mimic4患者住icu时间.csv"))
+c3=r6_cohort(file.path(RAW_DATA_DIR,"mimic3.csv"),"MIMIC-III CareVue","subject_id","icustay_id",
+             file.path(RAW_DATA_DIR,"mimic3患者住icu时间.csv"))
+ce=r6_cohort(file.path(RAW_DATA_DIR,"eicu.csv"),"eICU","patientunitstayid","patientunitstayid")
+write.csv(rbind(c4$audit,c3$audit,ce$audit),"Cohort_record_audit.csv",row.names=FALSE)
+warning("当前建模CSV不含患者/ICU记录ID：代码保留全部输入行；无法在本代码内核验重复患者、首次ICU记录或跨版本重叠。请确认上游SQL已完成去重。")
+data=c4$data
+stopifnot(!any(data$.stay %in% c("36622658","35073158","38180553","34531821")))
+if(SMOKE_TEST) {
+  OUTER_FOLDS=2L;INNER_FOLDS=2L;LASSO_FOLDS=2L;BORUTA_MAX_RUNS=40L
+  r6_grids=lapply(r6_grids,function(g)head(g,2L));RUN_SHAP=FALSE
+  warning("SMOKE_TEST=TRUE：调试运行，不是正式分析结果")
+}
+set.seed(SPLIT_SEED)
+inTrain=as.integer(caret::createDataPartition(data$Result,p=.7,list=FALSE))
+raw_dev=data[inTrain,,drop=FALSE];raw_vad=data[-inTrain,,drop=FALSE]
+stopifnot(!length(intersect(raw_dev$.patient,raw_vad$.patient)))
+write.csv(data.frame(Source_row=data$.source_row,Patient_ID=data$.patient,Stay_ID=data$.stay,
+                     Split=ifelse(seq_len(nrow(data)) %in% inTrain,"Train","Test")),"MIMICIV_split_manifest.csv",row.names=FALSE)
+write.csv(data.frame(Feature=CANDIDATE_FEATURES,Binary=CANDIDATE_FEATURES %in% BINARY_FEATURES),
+          "Candidate_predictors.csv",row.names=FALSE)
+for(nm in names(r6_grids)) write.csv(r6_grids[[nm]],paste0("Grid_",nm,".csv"),row.names=FALSE)
+saveRDS(list(source_md5=tools::md5sum(file.path(RAW_DATA_DIR,c("mimic4.csv","mimic3.csv","eicu.csv"))),
+             outer=OUTER_FOLDS,inner=INNER_FOLDS,lasso_folds=LASSO_FOLDS,boruta_max_runs=BORUTA_MAX_RUNS,
+             missing_limit=MISSING_LIMIT,split_seed=SPLIT_SEED,cv_seed=CV_SEED,smoke_test=SMOKE_TEST,
+             lasso_selection_rule=LASSO_SELECTION_RULE,
+             primary_model_candidates=PRIMARY_MODEL_CANDIDATES,
+             shap_explainable_models=SHAP_EXPLAINABLE_MODELS,
+             primary_model_exclusions=PRIMARY_MODEL_EXCLUSIONS,model_selection_rule=MODEL_SELECTION_RULE,
+             model_selection_timing=MODEL_SELECTION_TIMING,
+             shap_selected_model_only=SHAP_SELECTED_MODEL_ONLY,
+             shap_target_probability=SHAP_TARGET_PROBABILITY,
+             candidate_features=CANDIDATE_FEATURES,grids=r6_grids),"Run_configuration.rds")
+outer=r6_folds(raw_dev,OUTER_FOLDS,CV_SEED)
+saveRDS(lapply(outer,function(i)raw_dev$.source_row[i]),"Outer_CV_validation_rows.rds")
+oof=matrix(NA_real_,nrow(raw_dev),length(r6_grids),dimnames=list(NULL,names(r6_grids)))
+pipeline_oof=rep(NA_real_,nrow(raw_dev));outer_scores=list();outer_choices=list()
+for(k in seq_along(outer)) {
+  va=outer[[k]];tr=setdiff(seq_len(nrow(raw_dev)),va)
+  seed=CV_SEED+10000L*k;tag=paste0("Outer",k)
+  search=r6_search(raw_dev[tr,,drop=FALSE],seed,tag)
+  pp=r6_preprocess_fit(raw_dev[tr,,drop=FALSE],seed+9000L,paste0(tag,"_Refit"))
+  a=r6_preprocess_apply(pp,raw_dev[tr,,drop=FALSE]);b=r6_preprocess_apply(pp,raw_dev[va,,drop=FALSE])
+  for(nm in names(r6_grids)) {
+    q=search$best$Config[search$best$Model==nm]
+    fit=r6_fit(nm,a,r6_grids[[nm]][q,,drop=FALSE],seed+9500L)
+    oof[va,nm]=r6_predict(nm,fit,b)
+    outer_scores[[length(outer_scores)+1L]]=data.frame(Model=nm,Resample=tag,AUC=r6_auc(b$Result,oof[va,nm]))
+  }
+  pipeline_oof[va]=oof[va,search$selection$model]
+  outer_choices[[k]]=data.frame(Outer_fold=k,Selected_model=search$selection$model,
+                                Mean_AUC_leader=search$selection$leader,
+                                All_models_mean_AUC_leader=search$selection$overall_leader,
+                                Excluded_from_primary=search$selection$excluded,
+                                SHAP_used_for_selection=FALSE,
+                                Selection_rule=search$selection$rule,
+                                Pipeline_AUC=r6_auc(b$Result,pipeline_oof[va]))
+  saveRDS(list(oof=oof,pipeline_oof=pipeline_oof,completed_outer_folds=k),"Outer_CV_progress.rds")
+  message("外层第",k,"/",length(outer),"折完成")
+}
+stopifnot(!anyNA(oof),!anyNA(pipeline_oof))
+CV_fold_AUCs=do.call(rbind,outer_scores)
+write.csv(CV_fold_AUCs,"CV_fold_AUCs.csv",row.names=FALSE)
+write.csv(do.call(rbind,outer_choices),"Nested_CV_selection_procedure.csv",row.names=FALSE)
+write.csv(data.frame(Source_row=raw_dev$.source_row,Result=raw_dev$Result,oof,Selection_procedure=pipeline_oof),
+          "Nested_CV_out_of_fold_predictions.csv",row.names=FALSE)
+write.csv(do.call(rbind,lapply(split(CV_fold_AUCs,CV_fold_AUCs$Model),function(z)
+  data.frame(Model=z$Model[1],Mean_outer_AUC=mean(z$AUC),SD_outer_AUC=sd(z$AUC),
+             Pooled_OOF_AUC=r6_auc(raw_dev$Result,oof[,z$Model[1]])))),"Nested_CV_per_model.csv",row.names=FALSE)
+final_search=r6_search(raw_dev,CV_SEED+900000L,"FinalTraining")
+Model_selection_CV=final_search$selection$audit
+selected_model=final_search$selection$model
+stopifnot(!selected_model %in% PRIMARY_MODEL_EXCLUSIONS)
+Model_selection_CV$Selected=Model_selection_CV$Model==selected_model
+Model_selection_CV$Role="Final training-only tuning; not unbiased performance estimation"
+write.csv(Model_selection_CV,"Model_selection_CV.csv",row.names=FALSE)
+writeLines(selected_model,"Selected_model.txt")
+write.csv(data.frame(Highest_mean_AUC_model=final_search$selection$overall_leader,
+                     Eligible_mean_AUC_leader=final_search$selection$leader,
+                     Selected_model=selected_model,Selected_mean_inner_CV_AUC=final_search$selection$selected_mean_auc,
+                     Excluded_from_primary=final_search$selection$excluded,
+                     SHAP_used_for_selection=FALSE,
+                     SHAP_target_probability=SHAP_TARGET_PROBABILITY,
+                     Selection_rule=MODEL_SELECTION_RULE,Selection_timing=MODEL_SELECTION_TIMING,
+                     Evaluation_metrics_used_for_selection=FALSE),
+          "Selection_rule_audit.csv",row.names=FALSE)
+writeLines(c(paste("Selected primary model:",selected_model),
+             paste("Selection rule:",MODEL_SELECTION_RULE),
+             paste("Overall mean inner-CV AUC leader:",final_search$selection$overall_leader),
+             "SHAP availability was not used for model selection.",
+             paste("Excluded from primary selection:",final_search$selection$excluded),
+             "All nine algorithms, including Logistic, are eligible for primary selection in the current code.",
+             paste("Models with prespecified SHAP implementations:",paste(SHAP_EXPLAINABLE_MODELS,collapse=", ")),
+             sprintf("Selected mean final-training inner-CV AUC: %.10f",final_search$selection$selected_mean_auc),
+             "The same eligibility rule is applied inside each outer fold and in final training-only selection.",
+             "Outer-fold and Test/eICU/MIMIC-III performance values are not arguments to the selection function.",
+             MODEL_SELECTION_TIMING,
+             "This change does not demonstrate superiority, and rerunning does not restore untouched validation cohorts.",
+             paste("Split seed:",SPLIT_SEED,"; CV seed:",CV_SEED)),
+           "Primary_model_selection_explanation.txt")
+final_preprocess=r6_preprocess_fit(raw_dev,CV_SEED+999999L,"FinalRefit")
+saveRDS(final_preprocess,"Final_preprocess.rds")
+writeLines(final_preprocess$features,"Final_selected_features.txt")
+writeLines(LASSO_SELECTION_RULE,"LASSO_selection_rule.txt")
+lasso_stage_files=list.files("Pipeline_audit",pattern="_preprocess[.]rds$",full.names=TRUE)
+lasso_stage_audit=do.call(rbind,lapply(lasso_stage_files,function(f) {
+  z=readRDS(f);cv=z$lasso_cv;k=which(as.logical(cv$Selected));minimum=which.min(cv$Mean_deviance)
+  if(!identical(z$lasso_selection_rule,"lambda.min") || !identical(k,minimum) ||
+     !isTRUE(all.equal(z$lambda_ratio,cv$Ratio[minimum])))
+    stop("LASSO选择规则审计失败：",f)
+  data.frame(Stage=z$tag,LASSO_rule=z$lasso_selection_rule,Training_n=length(z$training_source_rows),
+             Selected_index=k,Min_deviance_index=minimum,Selected_ratio=z$lambda_ratio,
+             Selected_lambda=z$lambda,Mean_deviance=cv$Mean_deviance[k],
+             N_LASSO=length(z$lasso),N_Boruta=length(z$boruta),N_intersection=length(z$features),
+             Features=paste(z$features,collapse=";"),Passed=TRUE)
+}))
+write.csv(lasso_stage_audit,"LASSO_selection_all_stages.csv",row.names=FALSE)
+var=c("Result",final_preprocess$features)
+dev=r6_preprocess_apply(final_preprocess,raw_dev)
+vad=r6_preprocess_apply(final_preprocess,raw_vad)
+extra=r6_preprocess_apply(final_preprocess,ce$data)
+extra_mimic3=r6_preprocess_apply(final_preprocess,c3$data)
+traindata=dev;testdata=vad;validdata=extra;validdata_mimic3=extra_mimic3
+write.csv(dev,"dev.csv",row.names=FALSE);write.csv(vad,"vad.csv",row.names=FALSE)
+write.csv(data.frame(Feature=union(USER_SELECTED_FEATURES,var[-1]),
+                     User_previous_selection=union(USER_SELECTED_FEATURES,var[-1]) %in% USER_SELECTED_FEATURES,
+                     New_final_selection=union(USER_SELECTED_FEATURES,var[-1]) %in% var[-1]),
+          "Final_features_vs_user_list.csv",row.names=FALSE)
+message("最终特征：",paste(var[-1],collapse=", "),"；主模型：",selected_model)
+r6_best_grid=function(nm) r6_grids[[nm]][Model_selection_CV$Config[Model_selection_CV$Model==nm],,drop=FALSE]
+Tune_table=setNames(lapply(names(r6_methods)[1:7],r6_best_grid),r6_methods[1:7])
+Tune_table$glm=NULL
+r6_lgb_grid=r6_best_grid("LightGBM");r6_cat_grid=r6_best_grid("CatBoost")
+write.csv(data.frame(Model=names(r6_grids),Configurations=vapply(r6_grids,nrow,integer(1)),
+                     Best_parameters=vapply(names(r6_grids),function(nm)r6_params_text(r6_best_grid(nm)),character(1)),
+                     Selection="Final training-only inner CV"),"R1C6_Hyperparameters.csv",row.names=FALSE)
+models = c("glm","svmRadial","gbm","kknn","nnet","xgbTree","AdaBoost.M1")
+models_names = list(Logistic="glm",SVM="svmRadial",GBM="gbm",KNN="kknn",NeuralNetwork="nnet",Xgboost="xgbTree",Adaboost="AdaBoost.M1")
+train_probe = data.frame(Result = dev$Result)
+test_probe = data.frame(Result = vad$Result)
+extra_probe = data.frame(Result = extra$Result)
+extra_probe_mimic3 = data.frame(Result = extra_mimic3$Result)
+importance = list()
+ML_calss_model = list()
+pb = txtProgressBar(min = 0, max = length(models), style = 3)
+for (i in seq_along(models)) {
+  model <- models[i]
+  model_name <- names(models_names)[which(models_names == model)]
+  fit = r6_fit(model_name,dev,r6_best_grid(model_name),CV_SEED+1999999L)
+  train_Pro = predict(fit, newdata = dev, type = 'prob')
+  test_Pro = predict(fit, newdata = vad, type = 'prob')
+  extra_Pro = predict(fit, newdata = extra, type = 'prob')
+  extra_Pro_mimic3 = predict(fit, newdata = extra_mimic3, type = 'prob')
+  train_probe[[model_name]] <- train_Pro$Yes
+  test_probe[[model_name]] <- test_Pro$Yes
+  extra_probe[[model_name]] <- extra_Pro$Yes
+  extra_probe_mimic3[[model_name]] <- extra_Pro_mimic3$Yes
+  ML_calss_model[[model_name]] = fit
+  importance[[model_name]] = varImp(fit, scale = TRUE)
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+train = dev
+train$Result = ifelse(train$Result=="Yes",1,0)
+dtrain = lgb.Dataset(as.matrix(train[2:ncol(train)]), label = train$Result)
+test = vad[,var]
+test$Result = ifelse(test$Result=="Yes",1,0)
+valid = extra[,var]
+valid$Result = ifelse(valid$Result=="Yes",1,0)
+dtest = lgb.Dataset.create.valid(dtrain, as.matrix(test[2:ncol(test)]), label = test$Result)
+dextra = lgb.Dataset.create.valid(dtrain, as.matrix(valid[2:ncol(valid)]), label = valid$Result)
+params = r6_lgb_params(r6_lgb_grid,CV_SEED+1999999L)
+lightgbm_model = lgb.train(params=params,data=dtrain,nrounds=as.integer(r6_lgb_grid$nrounds))
+train_probe$LightGBM = predict(lightgbm_model,newdata = as.matrix(dev[2:ncol(dev)]))
+test_probe$LightGBM = predict(lightgbm_model,newdata = as.matrix(vad[2:ncol(vad)]))
+extra_probe$LightGBM = predict(lightgbm_model,newdata = as.matrix(extra[2:ncol(extra)]))
+extra_probe_mimic3$LightGBM = predict(lightgbm_model,newdata = as.matrix(extra_mimic3[2:ncol(extra_mimic3)]))
+lightGBM_Imp = lgb.importance(lightgbm_model, percentage = TRUE)
+write.csv(lightGBM_Imp,"LightGBM_important.csv",row.names = F)
+rt=read.csv("LightGBM_important.csv", header=T,check.names=F)
+g <- ggplot(rt, aes(x=Gain,y=reorder(Feature,Gain)))
+p2=g+geom_bar(aes(fill=Gain),stat = "identity",
+              width = 0.6,position = position_stack(reverse = TRUE),size=1)+
+  theme_classic()+
+  scale_fill_gradient()+
+  theme(plot.title = element_text(hjust = 0.5,size = 16),
+        legend.position = "none",
+        axis.text=element_text(size=10,face = "bold",color = "black"),
+        axis.title.x = element_text(size = 12,face = "bold",color = "black"),
+        axis.title.y = element_text(size = 12,face = "bold",color = "black"),
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12))+
+  labs(x="Importance Scores",y = "Features",title = "LightGBM")
+p2
+pdf("LightGBM_importance.pdf",7,5,family = "serif")
+print(p2)
+dev.off()
+train = dev
+train$Result = ifelse(train$Result=="Yes",1,0)
+train <- as.data.frame(lapply(train, function(x) {
+  if (is.integer(x)) {
+    return(as.numeric(x))
+  }
+  return(x)
+}))
+train_pool = catboost.load_pool(as.matrix(train[2:ncol(train)]),label = train$Result)
+test = vad[,var]
+test$Result = ifelse(test$Result=="Yes",1,0)
+test <- as.data.frame(lapply(test, function(x) {
+  if (is.integer(x)) {
+    return(as.numeric(x))
+  }
+  return(x)
+}))
+test_pool = catboost.load_pool(as.matrix(test[2:ncol(test)]),label =  test$Result)
+valid = extra[,var]
+valid$Result = ifelse(valid$Result=="Yes",1,0)
+valid <- as.data.frame(lapply(valid, function(x) {
+  if (is.integer(x)) {
+    return(as.numeric(x))
+  }
+  return(x)
+}))
+valid_pool = catboost.load_pool(as.matrix(valid[2:ncol(valid)]),label =  valid$Result)
+fit_params = r6_cat_params(r6_cat_grid,CV_SEED+1999999L)
+Catboost_model = catboost.train(train_pool,NULL,fit_params)
+train_probe$CatBoost = catboost.predict(Catboost_model, train_pool, prediction_type = 'Probability')
+test_probe$CatBoost = catboost.predict(Catboost_model, test_pool, prediction_type = 'Probability')
+extra_probe$CatBoost = catboost.predict(Catboost_model, valid_pool, prediction_type = 'Probability')
+valid_pool_mimic3 = catboost.load_pool(as.matrix(extra_mimic3[,-1]))
+extra_probe_mimic3$CatBoost = catboost.predict(Catboost_model, valid_pool_mimic3, prediction_type = 'Probability')
+Catboost_Imp = catboost.get_feature_importance(Catboost_model)
+Catboost_Imp = data.frame(Feature = colnames(dev)[2:ncol(dev)],Overall = Catboost_Imp)
+write.csv(Catboost_Imp,"CatBoost_important.csv",row.names = F)
+rt=read.csv("CatBoost_important.csv", header=T,check.names=F)
+g <- ggplot(rt, aes(x=Overall,y=reorder(Feature,Overall)))
+p2=g+geom_bar(aes(fill=Overall),stat = "identity",
+              width = 0.6,
+              position = position_stack(reverse = TRUE),
+              size=1)+
+  theme_classic()+
+  scale_fill_gradient()+
+  theme(plot.title = element_text(hjust = 0.5,size = 16),
+        legend.position = "none",
+        axis.text=element_text(size=10,
+                               face = "bold",
+                               color = "black"),
+        axis.title.x = element_text(size = 12,
+                                    face = "bold",
+                                    color = "black"),
+        axis.title.y = element_text(size = 12,
+                                    face = "bold",
+                                    color = "black"),
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12))+
+  labs(x="Importance Scores",y = "Features",title = "CatBoost")
+p2
+pdf("CatBoost_importance.pdf",7,5,family = "serif")
+print(p2)
+dev.off()
+for(model_name in names(models_names)){
+  imp = importance[[model_name]]
+  imp_table <- as.data.frame(imp$importance)
+  imp_table$Features <- rownames(imp_table)
+  if ("Yes" %in% colnames(imp_table)) {
+    fill_col <- "Yes"
+  } else if ("Overall" %in% colnames(imp_table)) {
+    fill_col <- "Overall"
+  } else {
+    stop("Neither 'Yes' nor 'Overall' column found in importance table.")
+  }
+  g = ggplot(imp_table, aes(x = !!sym(fill_col), y = reorder(Features, !!sym(fill_col))))
+  p2 = g + geom_bar(aes(fill = !!sym(fill_col)), stat = "identity", width = 0.6, position = position_stack(reverse = TRUE), size = 1) +
+    theme_classic() + scale_fill_gradient() +
+    theme(plot.title = element_text(hjust = 0.5, size = 16),
+          legend.position = "none",
+          axis.text = element_text(size = 10, face = "bold", color = "black"),
+          axis.title.x = element_text(size = 12, face = "bold", color = "black"),
+          axis.title.y = element_text(size = 12, face = "bold", color = "black"),
+          legend.title = element_text(size = 12), legend.text = element_text(size = 12)) +
+    labs(x = "Importance Scores", y = "Features", title = paste0(model_name, " "))
+  pdf(paste0(model_name, "_important.pdf"), 7, 5, family = "serif")
+  print(p2)
+  dev.off()
+}
+models_names = list(Logistic="glm",SVM="svmRadial",GBM="gbm",NeuralNetwork="nnet",KNN="kknn",
+                    Xgboost="xgbTree",Adaboost="AdaBoost.M1",LightGBM = "LightGBM",CatBoost = "CatBoost")
+Train = train_probe
+Test = test_probe
+Valid = extra_probe
+datalist = list(Train = train_probe, Test = test_probe,
+                eICU_Valid = extra_probe, MIMICIII_Valid = extra_probe_mimic3)
+choose_training_threshold <- function(y, p) {
+  stopifnot(length(y)==length(p), !anyNA(y), !anyNA(p), all(is.finite(p)),
+            all(p >= 0 & p <= 1), length(unique(y))==2L)
+  r = pROC::roc(y, p, levels=c("No","Yes"), direction="<", quiet=TRUE)
+  ok = which(is.finite(r$thresholds))
+  if (!length(ok)) stop("无有限阈值，模型预测可能为常数")
+  j = r$sensitivities + r$specificities - 1
+  best = ok[abs(j[ok] - max(j[ok])) < 1e-12]
+  min(r$thresholds[best])
+}
+fixed_thresholds = setNames(vapply(names(models_names), function(m) {
+  choose_training_threshold(raw_dev$Result, oof[,m])
+}, numeric(1)), names(models_names))
+fixed_threshold_table = data.frame(Model=names(fixed_thresholds),
+                                   Threshold=unname(fixed_thresholds), Source="MIMIC-IV training set: nested outer-fold held-out predictions",
+                                   Method="Maximum Youden index; smallest finite threshold if tied",
+                                   Rule="P(Yes) >= threshold")
+write.csv(fixed_threshold_table,"Fixed_thresholds.csv",row.names=FALSE)
+saveRDS(fixed_thresholds,"Fixed_thresholds_full_precision.rds")
+all_evaluation_metrics = list()
+all_auc_metrics = list()
+for (newdata_tt in names(datalist)) {
+  newdata = datalist[[newdata_tt]]
+  formula = as.formula(paste0("Result ~ ", paste(colnames(newdata)[2:ncol(newdata)], collapse = " + ")))
+  trellis.par.set(caretTheme())
+  cal_obj = calibration(formula, data = newdata, class = 'Yes',cuts = 3)
+  caldata=as.data.frame(cal_obj$data)
+  caldata=na.omit(caldata)
+  Calibrat_plot=ggplot(data = caldata,aes(x=midpoint,
+                                          y=Percent,
+                                          group = calibModelVar,
+                                          color=calibModelVar))+
+    geom_point(size=1)+
+    geom_line(linewidth=0.65)+
+    geom_abline(slope = 1, intercept = 0 ,color="black",linetype = 'dotdash')+
+    xlab("Bin Midpoint")+
+    ylab("Observed Event Percentage")+
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5,size = 15,face="bold"),
+      axis.text=element_text(size=12,face="bold"),
+      legend.position=c(0.75,0.3),
+      legend.background = element_blank(),
+      axis.title.y = element_text(size=12,face="bold"),
+      axis.title.x = element_text(size=12,face="bold"),
+      panel.border = element_rect(color="black",size=1),
+      panel.background = element_blank())+
+    scale_color_discrete(name = "Model")
+  pdf(paste0(newdata_tt,"Calibration.pdf"),5,5,family = "serif")
+  print(Calibrat_plot)
+  dev.off()
+  ROC_list = list()
+  ROC_label = list()
+  AUC_metrics = data.frame()
+  Evaluation_metrics = data.frame()
+  for (model_name in names(models_names)) {
+    stopifnot(!anyNA(newdata[,model_name]), all(is.finite(newdata[,model_name])),
+              all(newdata[,model_name]>=0 & newdata[,model_name]<=1))
+    ROC = pROC::roc(response=newdata$Result,predictor=newdata[,model_name],
+                    levels=c("No","Yes"),direction="<",quiet=TRUE)
+    AUC = round(auc(ROC),3)
+    CI = ci.auc(ROC)
+    label = paste0(model_name," (AUC=",sprintf("%0.3f", AUC),",95%CI:",sprintf("%0.3f", CI[1]),"-",sprintf("%0.3f", CI[3]),")")
+    bestp = unname(fixed_thresholds[model_name])
+    predlab = factor(ifelse(newdata[,model_name] >= bestp,"Yes","No"),levels=c("No","Yes"))
+    index_table = confusionMatrix(data = predlab,
+                                  reference = newdata$Result,
+                                  positive = "Yes",
+                                  mode="everything")
+    mydata = data.frame(reference=newdata$Result,prediction=predlab)
+    mytibble = tibble::as_tibble(table(mydata))
+    confusion_plot = plot_confusion_matrix(mytibble,
+                                           target_col = "reference",
+                                           prediction_col = "prediction",
+                                           counts_col = "n",
+                                           sub_col = NULL,
+                                           class_order = NULL,
+                                           add_sums = FALSE,
+                                           add_counts = TRUE,
+                                           add_normalized = TRUE,
+                                           add_row_percentages = F,
+                                           add_col_percentages = F,
+                                           diag_percentages_only = FALSE,
+                                           rm_zero_percentages = TRUE,
+                                           rm_zero_text = TRUE,
+                                           add_zero_shading = TRUE,
+                                           amount_3d_effect = 1,
+                                           add_arrows = TRUE,
+                                           counts_on_top = FALSE,
+                                           palette = "Blues",
+                                           intensity_by = "counts",
+                                           intensity_lims = NULL,
+                                           intensity_beyond_lims = "truncate",
+                                           theme_fn = ggplot2::theme_minimal,
+                                           place_x_axis_above = TRUE,
+                                           rotate_y_text = TRUE,
+                                           digits = 1,
+                                           font_counts = font(),
+                                           font_normalized = font(),
+                                           font_row_percentages = font(),
+                                           font_col_percentages = font(),
+                                           arrow_size = 0.048,
+                                           arrow_nudge_from_text = 0.065,
+                                           tile_border_color = NA,
+                                           tile_border_size = 0.1,
+                                           tile_border_linetype = "solid",
+                                           sums_settings = sum_tile_settings(),
+                                           darkness = 0.8)
+    pdf(paste0(newdata_tt,model_name,"_cm_plot.pdf"),5,5,family = "serif")
+    print(confusion_plot)
+    dev.off()
+    cm = index_table$table
+    TP = unname(cm["Yes","Yes"]); TN = unname(cm["No","No"])
+    FP = unname(cm["Yes","No"]); FN = unname(cm["No","Yes"])
+    safe_div = function(a,b) if (b==0) NA_real_ else a/b
+    Evaluation_metrics = rbind(Evaluation_metrics, data.frame(
+      DataSet=newdata_tt, Model=model_name, Threshold=bestp,
+      Accuracy=(TP+TN)/sum(cm), Sensitivity=safe_div(TP,TP+FN),
+      Specificity=safe_div(TN,TN+FP), Precision=safe_div(TP,TP+FP),
+      F1=safe_div(2*TP,2*TP+FP+FN), Recall=safe_div(TP,TP+FN),
+      PPV=safe_div(TP,TP+FP), NPV=safe_div(TN,TN+FN),
+      Kappa=unname(index_table$overall["Kappa"]), TP=TP,FP=FP,TN=TN,FN=FN))
+    AUC_metrics = rbind(AUC_metrics, data.frame(DataSet=newdata_tt,Model=model_name,
+                                                AUC=as.numeric(pROC::auc(ROC)),CI_low=as.numeric(CI[1]),CI_high=as.numeric(CI[3])))
+    ROC_label[[model_name]] = label
+    ROC_list[[model_name]] = ROC
+  }
+  write.csv(Evaluation_metrics,paste0(newdata_tt,"_Evaluation_metrics.csv"),row.names = F)
+  all_evaluation_metrics[[newdata_tt]] = Evaluation_metrics
+  all_auc_metrics[[newdata_tt]] = AUC_metrics
+  ROC_plot=pROC::ggroc(ROC_list,size=1.5,legacy.axes = T)+theme_bw()+
+    labs(title = ' ROC curve')+
+    theme(plot.title = element_text(hjust = 0.5,size = 15,face="bold"),
+          axis.text=element_text(size=12,face="bold"),
+          legend.title = element_blank(),
+          legend.text = element_text(size=12,face="bold"),
+          legend.position=c(0.7,0.25),
+          legend.background = element_blank(),
+          axis.title.y = element_text(size=12,face="bold"),
+          axis.title.x = element_text(size=12,face="bold"),
+          panel.border = element_rect(color="black",size=1),
+          panel.background = element_blank())+
+    geom_segment(aes(x = 0, y = 0, xend = 1, yend = 1),colour='grey',linetype = 'dotdash')+
+    scale_colour_discrete(
+      breaks=c(names(models_names)),
+      labels=c(ROC_label))
+  pdf(paste0(newdata_tt,"_ROC.pdf"),8,8,family = "serif")
+  print(ROC_plot)
+  dev.off()
+  dca_data = newdata
+  dca_data$Result=ifelse(dca_data$Result=="Yes",1,0)
+  DCA_list = list()
+  for (model_name in names(models_names)) {
+    dca_formula = as.formula(paste("Result ~", model_name))
+    set.seed(123)
+    dca_curvers = decision_curve(dca_formula,
+                                 data = dca_data,
+                                 study.design = "cohort",
+                                 fitted.risk = TRUE,
+                                 bootstraps = 50
+    )
+    DCA_list[[model_name]] = dca_curvers
+  }
+  dca = setNames(DCA_list, names(DCA_list))
+  pdf(paste0(newdata_tt,"DCA.pdf"),7,7,family = "serif")
+  dca_plot = plot_decision_curve(dca, curve.names = c(names(models_names)),
+                                 cost.benefit.axis = F,
+                                 confidence.intervals = "none" ,
+                                 lwd = 2,
+                                 legend.position ="topright")+theme(
+                                   plot.title = element_text(hjust = 0.5,size = 15,face="bold"),
+                                   axis.text=element_text(size=12,face="bold"),
+                                   legend.title = element_blank(),
+                                   legend.text = element_text(size=12,face="bold"),
+                                   legend.background = element_blank(),
+                                   axis.title.y = element_text(size=12,face="bold"),
+                                   axis.title.x = element_text(size=12,face="bold"),
+                                   panel.border = element_rect(color="black",size=1),
+                                   panel.background = element_blank())
+  print(dca_plot)
+  dev.off()
+  write.csv(dca_data,paste0(newdata_tt,"_PRplot.csv"),row.names = F)
+}
+Table2_fixed = do.call(rbind,all_evaluation_metrics)
+AUC_all = do.call(rbind,all_auc_metrics)
+stopifnot(all(vapply(split(Table2_fixed$Threshold,Table2_fixed$Model),
+                     function(z) length(unique(z))==1L,logical(1))))
+write.csv(Table2_fixed,"Table2_fixed_thresholds.csv",row.names=FALSE)
+write.csv(AUC_all,"AUC_all_cohorts.csv",row.names=FALSE)
+cohort_audit = do.call(rbind,lapply(names(datalist),function(nm) {
+  x=datalist[[nm]]
+  data.frame(Cohort=nm,N=nrow(x),Events=sum(x$Result=="Yes"),
+             Non_events=sum(x$Result=="No"),Prevalence=mean(x$Result=="Yes"))
+}))
+write.csv(cohort_audit,"Cohort_counts.csv",row.names=FALSE)
+saveRDS(list(predictions=datalist,thresholds=fixed_thresholds,metrics=Table2_fixed,
+             auc=AUC_all,variables=var,split_indices=inTrain),"R1C4_predictions_and_results.rds")
+saveRDS(ML_calss_model,"caret_models.rds")
+r2c3_export_details <- function(caret_models, grids, selection, predictors,
+                                lgb_params, cat_params, final_seed, smoke_test) {
+  nn=caret_models$NeuralNetwork; nf=nn$finalModel
+  stopifnot(length(nf$n)==3L,nf$n[1]==length(predictors),nf$n[3]==1L,
+            isTRUE(nf$entropy),!isTRUE(nf$softmax),nf$n[2]==nn$bestTune$size)
+  defaults=formals(getFromNamespace("nnet.default","nnet"))
+  p=nf$n[1];h=nf$n[2]
+  if(length(nf$wts)!=(p+1L)*h+(h+1L)) stop("网络连接数不同于预期的无跳层单隐层结构，请核查")
+  config_for=function(m) grids[[m]][selection$Config[selection$Model==m],,drop=FALSE]
+  scope=if(smoke_test) "SMOKE TEST ONLY; not manuscript results" else "Final fit on complete MIMIC-IV training set"
+  details=c(
+    Software=paste0("caret ",packageVersion("caret"),"; nnet ",packageVersion("nnet")),
+    Architecture="Fully connected feed-forward network with one hidden layer",
+    Input_units=as.character(p),Input_features=paste(predictors,collapse="; "),
+    Hidden_layers="1",Hidden_units=as.character(h),Hidden_activation="Logistic sigmoid",
+    Output_units="1",Output_activation="Logistic sigmoid",Predicted_event="Result=Yes (sepsis)",
+    Bias_terms="Hidden layer and output layer",Skip_connections="Not used",
+    Number_of_fitted_weights=as.character(length(nf$wts)),
+    Objective="Binary cross-entropy plus weight-decay penalty",Optimizer="BFGS",
+    Selected_weight_decay=as.character(nf$decay),
+    Hidden_units_search=paste(unique(grids$NeuralNetwork$size),collapse="; "),
+    Weight_decay_search=paste(unique(grids$NeuralNetwork$decay),collapse="; "),
+    Neural_network_configurations=as.character(nrow(grids$NeuralNetwork)),
+    Input_preprocessing="Training-subset centering and scaling after fold-specific imputation and selection",
+    Maximum_optimizer_iterations="500",Actual_optimizer_iterations="Not stored by nnet; do not equate maxit with iterations used",
+    Maximum_allowed_weights="10000 (capacity limit, not the actual parameter count)",
+    Initialization=paste0("nnet default random initialization within [-",defaults$rang,", ",defaults$rang,"]"),
+    Absolute_stopping_tolerance=as.character(defaults$abstol),
+    Relative_stopping_tolerance=as.character(defaults$reltol),
+    Fixed_learning_rate="Not specified; BFGS optimization (not Adam/SGD)",
+    Mini_batch_size="Not applicable to this full-data BFGS fit",Dropout="Not used",
+    Early_stopping_on_evaluation_data="Not used",Final_fit_R_seed=as.character(final_seed),
+    Final_fit_convergence_code=as.character(nf$convergence),
+    Convergence_interpretation=if(nf$convergence==0L) "Optimizer stopped without reaching maxit" else "Maximum iterations reached; check optimization before reporting",
+    Final_selected_model=as.character(selection$Model[selection$Selected]),
+    Role=if(selection$Selected[selection$Model=="NeuralNetwork"]) "Selected primary model" else "Candidate comparator; not selected primary model")
+  write.csv(data.frame(Item=names(details),Value=unname(details),Scope=scope),
+            "R2C3_NeuralNetwork_architecture_and_training.csv",row.names=FALSE)
+  fixed=list(
+    Logistic="Unpenalized binomial GLM with logit link; intercept included; no model hyperparameter search",
+    SVM="Radial basis kernel; training-subset centering/scaling; remaining engine defaults",
+    GBM="Bernoulli classification via caret gbm; verbose=FALSE; remaining engine defaults",
+    KNN="Training-subset centering/scaling; remaining engine defaults",
+    NeuralNetwork=paste0("Single hidden layer; logistic activations; binary entropy; BFGS; maxit=500; MaxNWts=10000; ",
+                         "rang=",defaults$rang,"; abstol=",defaults$abstol,"; reltol=",defaults$reltol,"; skip=FALSE; trace=FALSE"),
+    Xgboost="nthread=2; verbose=0; binary classification via caret xgbTree; remaining engine defaults",
+    Adaboost="AdaBoost.M1 via caret/adabag; remaining engine defaults",
+    LightGBM=r6_params_text(lgb_params),CatBoost=r6_params_text(cat_params))
+  all_details=do.call(rbind,lapply(names(grids),function(m) {
+    gs=grids[[m]]
+    space=paste(vapply(names(gs),function(nm) paste0(nm,"={",paste(unique(as.character(gs[[nm]])),collapse=", "),"}"),character(1)),collapse="; ")
+    data.frame(Model=m,Configurations=nrow(gs),Search_space=space,
+               Selected_settings=r6_params_text(config_for(m)),Fixed_settings=fixed[[m]],
+               Selection_basis="Mean final-training inner-fold AUC; no evaluation-set tuning",
+               Scope=scope,stringsAsFactors=FALSE)
+  }))
+  write.csv(all_details,"R2C3_All_models_search_and_selected_settings.csv",row.names=FALSE)
+  saveRDS(lapply(caret_models,function(z)list(method=z$method,bestTune=z$bestTune,
+                                              train_call=z$call,engine_call=tryCatch(z$finalModel$call,error=function(e)
+                                                "Engine call is not accessible with $call; see saved model object"),preProcess=z$preProcess)),
+          "R2C3_Fitted_calls_and_preprocessing.rds")
+  writeLines(capture.output(list(nnet_default_arguments=defaults,neural_network_fitted_call=nf$call,
+                                 architecture=nf$n,fitted_weight_count=length(nf$wts),convergence=nf$convergence,
+                                 actual_LightGBM_parameters=lgb_params,actual_CatBoost_parameters=cat_params)),
+             "R2C3_Engine_and_network_details.txt")
+  if(nf$convergence!=0L) warning("神经网络最终拟合达到最大迭代次数，请核查R2C3结构表中的收敛状态；本报告模块不会擅自改参数重训。")
+  message("R2C3报告已导出；模型拟合、预测、阈值与绘图未被修改。")
+}
+r2c3_export_details(ML_calss_model,r6_grids,Model_selection_CV,final_preprocess$features,
+                    params,fit_params,CV_SEED+1999999L,SMOKE_TEST)
+lgb.save(lightgbm_model,"LightGBM_model.txt")
+catboost.save_model(Catboost_model,"CatBoost_model.cbm")
+writeLines(capture.output(sessionInfo()),"sessionInfo.txt")
+writeLines(capture.output(print(fixed_threshold_table)),"Threshold_audit.txt")
+message("固定阈值分析完成；四队列阈值一致性检查通过。")
+if(selected_model=="Logistic") {
+  bb=coef(ML_calss_model$Logistic$finalModel)
+  write.csv(data.frame(Term=names(bb),Coefficient=as.numeric(bb)),"Logistic_coefficients.csv",row.names=FALSE)
+}
+Brier_descriptive=do.call(rbind,lapply(names(datalist),function(ds){
+  z=datalist[[ds]]; y=as.integer(z$Result=="Yes")
+  do.call(rbind,lapply(names(z)[-1],function(m)
+    data.frame(DataSet=ds,Model=m,Brier=mean((z[[m]]-y)^2))))
+}))
+write.csv(Brier_descriptive,"Brier_descriptive.csv",row.names=FALSE)
+r1c6_delong=list()
+for (ds in setdiff(names(datalist),'Train')) {
+  z=datalist[[ds]]
+  main_roc=pROC::roc(z$Result,z[[selected_model]],levels=c('No','Yes'),direction='<',quiet=TRUE)
+  for (cmp in setdiff(names(models_names),selected_model)) {
+    other_roc=pROC::roc(z$Result,z[[cmp]],levels=c('No','Yes'),direction='<',quiet=TRUE)
+    dd=pROC::roc.test(main_roc,other_roc,method='delong',paired=TRUE,alternative='two.sided')
+    stopifnot(length(dd$conf.int)==2L,is.finite(dd$p.value))
+    r1c6_delong[[length(r1c6_delong)+1L]]=data.frame(
+      DataSet=ds,Selected_model=selected_model,Comparator=cmp,
+      AUC_selected=as.numeric(pROC::auc(main_roc)),AUC_comparator=as.numeric(pROC::auc(other_roc)),
+      AUC_difference=as.numeric(pROC::auc(main_roc)-pROC::auc(other_roc)),
+      Difference_CI95_low=as.numeric(dd$conf.int[1]),Difference_CI95_high=as.numeric(dd$conf.int[2]),
+      P_raw=dd$p.value,Analysis='Exploratory paired DeLong; not a selection criterion')
+  }
+}
+r1c6_delong=do.call(rbind,r1c6_delong)
+stopifnot(nrow(r1c6_delong)==24L)
+r1c6_delong$P_Holm_24=p.adjust(r1c6_delong$P_raw,method='holm')
+r1c6_delong$CI_note='Pointwise 95% CI; not adjusted for multiple comparisons'
+write.csv(r1c6_delong,'R1C6_Selected_vs_others_DeLong.csv',row.names=FALSE)
+write.csv(subset(r1c6_delong,(Selected_model=='Logistic' & Comparator=='NeuralNetwork') | (Selected_model=='NeuralNetwork' & Comparator=='Logistic')),
+          'R1C6_Logistic_vs_NeuralNetwork_DeLong.csv',row.names=FALSE)
+lr_nn=do.call(rbind,lapply(setdiff(names(datalist),"Train"),function(ds) {
+  z=datalist[[ds]]
+  a=pROC::roc(z$Result,z$Logistic,levels=c("No","Yes"),direction="<",quiet=TRUE)
+  b=pROC::roc(z$Result,z$NeuralNetwork,levels=c("No","Yes"),direction="<",quiet=TRUE)
+  tt=pROC::roc.test(a,b,method="delong",paired=TRUE)
+  data.frame(DataSet=ds,Contrast="Logistic minus NeuralNetwork",AUC_difference=as.numeric(pROC::auc(a)-pROC::auc(b)),
+             CI_low=tt$conf.int[1],CI_high=tt$conf.int[2],P_raw=tt$p.value)
+}))
+lr_nn$P_Holm_3=p.adjust(lr_nn$P_raw,"holm")
+lr_nn$Family="Separate targeted sensitivity family of three LR-vs-NN contrasts; not an alternative adjustment for main comparisons"
+r6_pair_key=function(ds,a,b) paste(ds,paste(sort(c(a,b)),collapse="|"),sep="::")
+main_key=mapply(r6_pair_key,r1c6_delong$DataSet,r1c6_delong$Selected_model,r1c6_delong$Comparator)
+lr_key=vapply(lr_nn$DataSet,function(ds)r6_pair_key(ds,"Logistic","NeuralNetwork"),character(1))
+keys=c(main_key,lr_key);ps=c(r1c6_delong$P_raw,lr_nn$P_raw)
+unique_idx=!duplicated(keys);adjusted=setNames(p.adjust(ps[unique_idx],"holm"),keys[unique_idx])
+r1c6_delong$P_Holm_24=NULL
+r1c6_delong$P_Holm_all=unname(adjusted[main_key]);r1c6_delong$Family_size=sum(unique_idx)
+lr_nn$P_Holm_3=NULL;lr_nn$P_Holm_all=unname(adjusted[lr_key]);lr_nn$Family_size=sum(unique_idx)
+lr_nn$Family="All unique selected-vs-other and logistic-vs-neural-network contrasts across 3 cohorts"
+write.csv(r1c6_delong,"R1C6_Selected_vs_others_DeLong.csv",row.names=FALSE)
+write.csv(lr_nn,"R1C6_Logistic_vs_NeuralNetwork_DeLong.csv",row.names=FALSE)
+write.csv(data.frame(Comparison=keys[unique_idx],P_raw=ps[unique_idx],P_Holm_all=unname(adjusted)),
+          "R1C6_DeLong_multiplicity_family.csv",row.names=FALSE)
+writeLines(c(
+  "True nested CV: outer 5-fold evaluation; inner 5-fold model/hyperparameter selection (unless SMOKE_TEST).",
+  "LASSO auxiliary 5-fold CV also refits missingness filtering and imputation.",
+  "Median for continuous predictors; mode for prespecified binary predictors; no outcomes used in imputation.",
+  "Boruta confirmed variables after TentativeRoughFix intersect nonzero LASSO coefficients at the minimum mean auxiliary-CV binomial deviance (lambda.min rule).",
+  "The 60-point lambda/lambda_max grid is re-evaluated within each training subset; lambda_max is estimated within each auxiliary training fold.",
+  "The LASSO lambda.min rule concerns predictor selection; algorithm selection uses the separate rule below.",
+  "All nine algorithms are tuned and fitted, and all nine, including Logistic, are eligible for primary selection.",
+  paste("Primary algorithm selection rule:",MODEL_SELECTION_RULE),
+  paste("Models with an implemented SHAP pathway:",paste(SHAP_EXPLAINABLE_MODELS,collapse=", ")),
+  "The highest mean inner-CV AUC determines the primary model; exact AUC ties use deterministic model-name ordering. SHAP availability is not a selection criterion.",
+  "This rule is applied within each outer training subset and again on the complete development training subset.",
+  "Outer-fold and evaluation-set metrics are not used as numerical selection criteria.",
+  MODEL_SELECTION_TIMING,
+  "No current candidate is excluded because all nine models have a defined SHAP pathway in this code.",
+  paste("Only the selected primary model receives SHAP analysis; the illustrative waterfall case targets predicted probability",SHAP_TARGET_PROBABILITY,"using the closest available training observation."),
+  "Existing evaluation results were already available during earlier analyses; rerunning does not make these cohorts newly untouched.",
+  "Every algorithm threshold uses its nested outer-fold predictions from training patients; held fixed across evaluation cohorts.",
+  "Outer-fold threshold-source models may differ in hyperparameters and selected features; threshold transport to the final refit needs calibration assessment.",
+  "Outer CV selection-procedure AUC evaluates the selection procedure; it is not a claim that the final single selected algorithm was fixed in every fold.",
+  "Patient-level deduplication is conditional on supplied identifiers and time data; for the current ID-free CSVs all rows are retained and first-admission status cannot be verified. See Cohort_record_audit.csv.",
+  "Person-level repeat admissions and MIMIC version overlap cannot be audited from the current de-identified modeling CSVs.",
+  "Data source SQL, retrospective sepsis ascertainment, and predictor timing are not rederived by this modeling script.",
+  "Single imputation does not propagate imputation uncertainty. All new performance results must replace previous results.",
+  paste("SMOKE_TEST:",SMOKE_TEST)
+),"R1C6_Methods_and_limitations.txt")
+DEPENDENCE_FEATURE=if("GCS" %in% var) "GCS" else final_preprocess$features[1]
+writeLines(DEPENDENCE_FEATURE,"SHAP_dependence_feature.txt")
+ML_calss_model$LightGBM = lightgbm_model
+ML_calss_model$CatBoost = Catboost_model
+n_train = min(1500L,nrow(dev))
+n_test = min(500L,nrow(vad))
+if (RUN_SHAP) {
+  names(models_names)
+  best_Model = selected_model
+  set.seed(52)
+  shap_probability <- function(object,X) {
+    if (best_Model=="LightGBM") {
+      p <- as.numeric(predict(object,as.matrix(X)))
+    } else if (best_Model=="CatBoost") {
+      p <- as.numeric(catboost::catboost.predict(
+        object,catboost::catboost.load_pool(as.matrix(X)),prediction_type="Probability"))
+    } else {
+      p <- as.numeric(predict(object,newdata=as.data.frame(X),type="prob")$Yes)
+    }
+    matrix(p,ncol=1L,dimnames=list(NULL,"Yes"))
+  }
+  explain_kernel=kernelshap(ML_calss_model[[best_Model]],dev[1:n_train,-1],
+                            bg_X=dev[seq_len(min(n_test,nrow(dev))),-1],
+                            pred_fun=shap_probability)
+  shap_result=shapviz(explain_kernel,X_pred=dev[1:n_train,-1],interactions=TRUE)
+  shap_value=if(inherits(shap_result,"shapviz")) list(Yes=shap_result) else shap_result
+  if(is.null(shap_value$Yes) || !inherits(shap_value$Yes,"shapviz"))
+    stop("主模型的事件概率SHAP结果中缺少Yes输出。")
+  shap_check=max(abs(rowSums(shap_value$Yes$S)+shap_value$Yes$baseline-
+                       train_probe[[best_Model]][1:n_train]))
+  stopifnot(is.finite(shap_check),shap_check<1e-7)
+  write.csv(data.frame(Model=best_Model,SHAP_scale="predicted probability",
+                       Max_additivity_error=shap_check),
+            "SHAP_probability_check.csv",row.names=FALSE)
+  saveRDS(shap_value,paste0("SHAP_",best_Model,"_values.rds"))
+  ss_importance=sort(colMeans(abs(shap_value$Yes$S)),decreasing=TRUE)
+  write.csv(data.frame(Feature=names(ss_importance),Mean_abs_SHAP=as.numeric(ss_importance)),
+            paste0(best_Model,"_SHAP_importance.csv"),row.names=FALSE)
+  shap_case_row=which.min(abs(train_probe[[best_Model]][1:n_train]-
+                                SHAP_TARGET_PROBABILITY))
+  shap_case_probability=train_probe[[best_Model]][shap_case_row]
+  write.csv(data.frame(Model=best_Model,Training_row=shap_case_row,
+                       Target_probability=SHAP_TARGET_PROBABILITY,
+                       Predicted_probability=shap_case_probability,
+                       Absolute_difference=abs(shap_case_probability-SHAP_TARGET_PROBABILITY)),
+            "SHAP_selected_case.csv",row.names=FALSE)
+  pdf(paste0("SHAP_",best_Model,"_sv_force1.pdf"),8,6)
+  print(sv_force(shap_value$Yes, row_id = shap_case_row,size = 9)+
+          ggtitle(label = paste0("",best_Model))+
+          theme(plot.margin = margin(5.5,12,5.5,12),
+                plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+  )
+  dev.off()
+  pdf(paste0("SHAP_",best_Model,"_importance_beeswarm.pdf"),8,6)
+  print(sv_importance(shap_value$Yes, kind = "beeswarm",
+                      max_display = 30,
+                      viridis_args = list(begin = 0.25, end = 0.85, option = "B"),
+                      show_numbers = F)+
+          ggtitle(label = paste0("",best_Model))+
+          theme_bw()+
+          ggtitle(label = paste0("",best_Model))+
+          theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+  )
+  dev.off()
+  pdf(paste0("SHAP_",best_Model,"_importance_bar.pdf"),8,6)
+  print(sv_importance(shap_value$Yes, kind = "bar", show_numbers = F,
+                      fill = "#fca50a",
+                      max_display = 21,
+                      class = "Yes")+
+          theme_bw()+
+          ggtitle(label = paste0("",best_Model))+
+          theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+  )
+  dev.off()
+  colnames(dev)
+  pdf(paste0("SHAP_",best_Model,"_dependence3.pdf"),5,5)
+  print(sv_dependence(shap_value$Yes,v = DEPENDENCE_FEATURE,
+                      color = "#3b528b",
+                      color_var = DEPENDENCE_FEATURE,
+  )+
+    theme_bw()+
+    ggtitle(label = paste0("",best_Model))+
+    theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+  )
+  dev.off()
+  pdf(paste0("SHAP_",best_Model,"_waterfall1.pdf"),5,5)
+  print(sv_waterfall(shap_value$Yes, row_id = shap_case_row,
+                     fill_colors = c("#f7d13d", "#a52c60"))+
+          theme_bw()+
+          ggtitle(label = paste0("",best_Model))+
+          theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+  )
+  dev.off()
+  if (!SHAP_SELECTED_MODEL_ONLY) {
+    best_Model = "LightGBM"
+    shap_value = shapviz(ML_calss_model[[best_Model]],X_pred = as.matrix(dev[1:n_train,-1]))
+    saveRDS(shap_value,"SHAP_LightGBM_values.rds")
+    pdf(paste0("SHAP_",best_Model,"_sv_force0.pdf"),7,5)
+    print(sv_force(shap_value, row_id = 14,size = 9)+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    pdf(paste0("SHAP_",best_Model,"_importance_beeswarm.pdf"),8,6)
+    print(sv_importance(shap_value, kind = "beeswarm",
+                        viridis_args = list(begin = 0.25, end = 0.85, option = "B"),
+                        show_numbers = F)+
+            ggtitle(label = paste0("",best_Model))+
+            theme_bw()+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    pdf(paste0("SHAP_",best_Model,"_importance_bar.pdf"),8,6)
+    print(sv_importance(shap_value, kind = "bar", show_numbers = F,
+                        fill = "#fca50a",
+                        class = "Yes")+
+            theme_bw()+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    colnames(dev)
+    pdf(paste0("SHAP_",best_Model,"_dependence3.pdf"),5,5)
+    print(sv_dependence(shap_value,v = DEPENDENCE_FEATURE,
+                        color = "#3b528b",
+                        color_var = DEPENDENCE_FEATURE,
+    )+
+      theme_bw()+
+      ggtitle(label = paste0("",best_Model))+
+      theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    pdf(paste0("SHAP_",best_Model,"_waterfall0.pdf"),5,5)
+    print(sv_waterfall(shap_value, row_id = 14,
+                       fill_colors = c("#f7d13d", "#a52c60"))+
+            theme_bw()+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    best_Model = "CatBoost"
+    shapviz.catboost.Model <- function(object, X_pred, X = X_pred, collapse = NULL, ...) {
+      if (!requireNamespace("catboost", quietly = TRUE)) {
+        stop("Package 'catboost' not installed")
+      }
+      stopifnot(    "X must be a matrix or data.frame. It can't be an object of class catboost.Pool" =
+                      is.matrix(X) || is.data.frame(X),
+                    "X_pred must be a matrix, a data.frame, or a catboost.Pool" =
+                      is.matrix(X_pred) || is.data.frame(X_pred) || inherits(X_pred, "catboost.Pool"),
+                    "X_pred must have column names" = !is.null(colnames(X_pred))  )
+      feature_names = colnames(X)
+      if (!inherits(X_pred, "catboost.Pool")) {
+        X_pred <- catboost.load_pool(X_pred)
+      }
+      S <- catboost.get_feature_importance(object, X_pred, type = "ShapValues", ...)
+      pp <- ncol(X) + 1L
+      baseline <- S[1L, pp]
+      S <- S[, -pp, drop = FALSE]
+      colnames(S) <- feature_names
+      shapviz(S, X = X, baseline = baseline, collapse = collapse)
+    }
+    for (i in colnames(dev)[2:ncol(dev)]) {
+      dev[,i] = as.numeric(dev[,i])
+    }
+    shap_value = shapviz(ML_calss_model[[best_Model]], X_pred = dev[1:n_train,-1])
+    saveRDS(shap_value,"SHAP_CatBoost_values.rds")
+    pdf(paste0("SHAP_",best_Model,"_sv_force.pdf"),7,5)
+    print(sv_force(shap_value, row_id = 12,size = 9)+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    pdf(paste0("SHAP_",best_Model,"_importance_beeswarm.pdf"),7,5)
+    print(sv_importance(shap_value, kind = "beeswarm",
+                        viridis_args = list(begin = 0.25, end = 0.85, option = "B"),
+                        show_numbers = F)+
+            ggtitle(label = paste0("",best_Model))+
+            theme_bw()+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    pdf(paste0("SHAP_",best_Model,"_importance_bar.pdf"),7,5)
+    print(sv_importance(shap_value, kind = "bar", show_numbers = F,
+                        fill = "#fca50a",
+                        class = "Yes")+
+            theme_bw()+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    colnames(dev)
+    pdf(paste0("SHAP_",best_Model,"_dependence.pdf"),5,5)
+    print(sv_dependence(shap_value,v = "Temperature",
+                        color = "#3b528b",
+                        color_var = "Temperature",
+    )+
+      theme_bw()+
+      ggtitle(label = paste0("",best_Model))+
+      theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+    pdf(paste0("SHAP_",best_Model,"_waterfall.pdf"),5,5)
+    print(sv_waterfall(shap_value, row_id = 12,
+                       fill_colors = c("#f7d13d", "#a52c60"))+
+            theme_bw()+
+            ggtitle(label = paste0("",best_Model))+
+            theme(plot.title = element_text(hjust = 0.5,face = "bold",color = "black"))
+    )
+    dev.off()
+  }
+}
+message("全部输出完成：",OUTPUT_DIR)
+best_Model=selected_model
+RUN_R1C7 <- TRUE
+R1C7_BOOTSTRAPS <- 1000L
+R1C7_BOOT_SEED <- 7102026L
+R1C7_LOGIT_EPS <- 1e-6
+R1C7_LOWESS_SPAN <- 2/3
+R1C7_DCA_THRESHOLDS <- seq(0.01,0.99,by=0.01)
+R1C7_DCA_EXAMPLES <- c(0.10,0.20,0.30)
+R1C7_ACTION <- paste(
+  "At the 24-hour ICU landmark, a model alert would prompt an additional clinician-led",
+  "review of infection-related signs and laboratory trends, with closer subsequent surveillance",
+  "for emerging infection/organ dysfunction when clinically indicated; routine ICU care continues for everyone.")
+R1C7_ACTION_STATUS <- "Hypothetical use case introduced during revision; not an implemented or clinically validated pathway"
+r7_glm_coef <- function(x,y,offset=rep(0,length(y))) {
+  warnings=character()
+  fit=tryCatch(withCallingHandlers(
+    stats::glm.fit(x=x,y=y,offset=offset,family=binomial(),control=glm.control(maxit=100L)),
+    warning=function(w) {warnings<<-c(warnings,conditionMessage(w));invokeRestart("muffleWarning")}),
+    error=function(e) NULL)
+  ok=!is.null(fit) && isTRUE(fit$converged) && fit$rank==ncol(x) && all(is.finite(fit$coefficients))
+  list(coef=if(ok)fit$coefficients else rep(NA_real_,ncol(x)),
+       issue=if(ok && !length(warnings)) "" else paste(c(
+         if(ok) "Calibration GLM warning; finite converged estimate retained" else "Calibration GLM unavailable/nonconverged",
+         unique(warnings)),collapse="; "))
+}
+r7_calibration <- function(y,p,eps=R1C7_LOGIT_EPS,span=R1C7_LOWESS_SPAN) {
+  stopifnot(length(y)==length(p),all(y %in% 0:1),!anyNA(y),!anyNA(p),all(is.finite(p)),all(p>=0&p<=1))
+  lp=qlogis(pmin(pmax(p,eps),1-eps))
+  intercept=slope=NA_real_;issues=character()
+  if(length(unique(y))==2L) {
+    a=r7_glm_coef(matrix(1,length(y),1L),y,offset=lp);intercept=a$coef[1]
+    if(nzchar(a$issue)) issues=c(issues,a$issue)
+    if(diff(range(lp))>1e-10) {
+      separated=max(lp[y==0])<=min(lp[y==1]) || max(lp[y==1])<=min(lp[y==0])
+      if(separated) issues=c(issues,"Complete/quasi separation in calibration slope model") else {
+        b=r7_glm_coef(cbind(1,lp),y);slope=b$coef[2]
+        if(nzchar(b$issue)) issues=c(issues,b$issue)
+      }
+    } else issues=c(issues,"Constant probabilities: slope undefined")
+  } else issues=c(issues,"Only one outcome class: intercept/slope undefined")
+  smooth=tryCatch({
+    if(length(unique(p))==1L) rep(mean(y),length(p)) else {
+      z=stats::lowess(p,y,f=span,iter=0L,delta=0.01*diff(range(p)))
+      stats::approx(z$x,z$y,xout=p,ties=mean,rule=2)$y
+    }
+  },error=function(e)rep(NA_real_,length(p)))
+  smooth_bounded=pmin(pmax(smooth,0),1)
+  ici=if(all(is.finite(smooth_bounded))) mean(abs(smooth_bounded-p)) else NA_real_
+  if(!is.finite(ici)) issues=c(issues,"LOWESS calibration curve unavailable")
+  list(values=c(CITL_intercept=unname(intercept),Calibration_slope=unname(slope),
+                Brier=mean((p-y)^2),ICI=ici),smooth=smooth_bounded,
+       logit_clipped=sum(p<eps|p>1-eps),smooth_clipped=sum(smooth<0|smooth>1,na.rm=TRUE),
+       issue=paste(unique(issues),collapse="; "))
+}
+r7_ci <- function(x,B,min_fraction=.95) {
+  v=x[is.finite(x)];ok=length(v)>=ceiling(min_fraction*B)
+  c(low=if(ok)unname(quantile(v,.025,type=7)) else NA_real_,
+    high=if(ok)unname(quantile(v,.975,type=7)) else NA_real_,valid=length(v))
+}
+r7_export <- function(predictions,selected_model,fixed_thresholds,output_root,smoke_test=FALSE,
+                      B=R1C7_BOOTSTRAPS,seed=R1C7_BOOT_SEED) {
+  if(smoke_test) B=min(as.integer(B),100L)
+  if(B<20L) stop("Bootstrap次数过少；正式运行默认1000次")
+  if(!smoke_test && B<1000L) warning("正式CI建议至少保留本版默认的1000次；当前设置低于默认")
+  models=names(predictions[[1]])[-1]
+  stopifnot(selected_model %in% models,all(models %in% names(fixed_thresholds)),
+            all(vapply(predictions,function(z)identical(names(z),c("Result",models)),logical(1))))
+  out=file.path(output_root,"R1C7_calibration_DCA")
+  if(dir.exists(out) && length(list.files(out))) {
+    out=paste0(out,"_",format(Sys.time(),"%Y%m%d_%H%M%S"))
+    if(dir.exists(out)) stop("第7条输出目录已存在，请更改目录或稍后再试")
+  }
+  dir.create(out,recursive=TRUE,showWarnings=FALSE)
+  had_seed=exists(".Random.seed",envir=.GlobalEnv,inherits=FALSE)
+  if(had_seed) old_seed=get(".Random.seed",envir=.GlobalEnv)
+  on.exit(if(had_seed) assign(".Random.seed",old_seed,envir=.GlobalEnv) else
+    if(exists(".Random.seed",envir=.GlobalEnv,inherits=FALSE)) rm(".Random.seed",envir=.GlobalEnv),add=TRUE)
+  scope=if(smoke_test) "SMOKE TEST ONLY; not manuscript results" else "Formal evaluation of saved final-model predictions"
+  pt=sort(unique(c(round(R1C7_DCA_THRESHOLDS,12),round(R1C7_DCA_EXAMPLES,12),unname(fixed_thresholds))))
+  pt=pt[is.finite(pt)&pt>0&pt<1];w=pt/(1-pt)
+  metric_rows=dca_rows=diagnostics=list();bootstrap_values=list()
+  metric_count=dca_count=diagnostic_count=0L
+  ideals=c(CITL_intercept=0,Calibration_slope=1,Brier=0,ICI=0)
+  saveRDS(list(B=B,seed=seed,logit_epsilon=R1C7_LOGIT_EPS,lowess_span=R1C7_LOWESS_SPAN,
+               lowess_iter=0L,lowess_delta="0.01 * predicted-probability range",smooth_bounded_to=c(0,1),
+               thresholds=pt,examples=R1C7_DCA_EXAMPLES,action=R1C7_ACTION,action_status=R1C7_ACTION_STATUS,
+               model=selected_model,smoke_test=smoke_test,
+               CI="Percentile 2.5/97.5%; unstratified row bootstrap; fixed predictions; pointwise; at least 95% valid replicates"),
+          file.path(out,"R1C7_configuration.rds"))
+  for(di in seq_along(predictions)) {
+    ds=names(predictions)[di];z=predictions[[di]];n=nrow(z)
+    if(!all(as.character(z$Result) %in% c("No","Yes"))) stop(ds,": Result需要No/Yes")
+    y=as.integer(z$Result=="Yes");rho=mean(y)
+    if(length(unique(y))<2L) stop(ds,": 整个队列只有一种结局，无法完整评价")
+    role=if(ds=="Train") "Apparent training performance; no optimism correction" else "Evaluation cohort; conditional on fitted models"
+    set.seed(seed+di)
+    idx=matrix(sample.int(n,n*B,replace=TRUE),nrow=n,ncol=B)
+    counts=vapply(seq_len(B),function(b)tabulate(idx[,b],nbins=n),integer(n))
+    storage.mode(counts)="double"
+    prevalence_boot=as.vector(crossprod(y,counts))/n
+    nb_all=rho-(1-rho)*w
+    all_boot=outer(rep(1,length(pt)),prevalence_boot)-outer(w,1-prevalence_boot)
+    for(m in models) {
+      p=z[[m]];point=r7_calibration(y,p)
+      boot=matrix(NA_real_,nrow=B,ncol=4L,dimnames=list(NULL,names(point$values)))
+      issue_count=0L
+      for(b in seq_len(B)) {
+        q=r7_calibration(y[idx[,b]],p[idx[,b]])
+        boot[b,]=q$values
+        if(nzchar(q$issue)) issue_count=issue_count+1L
+      }
+      bootstrap_values[[paste(ds,m,sep="::")]]=boot
+      for(metric in names(point$values)) {
+        ci=r7_ci(boot[,metric],B);metric_count=metric_count+1L
+        point_valid=is.finite(point$values[[metric]])
+        if(!point_valid) ci[c("low","high")]=NA_real_
+        metric_rows[[metric_count]]=data.frame(DataSet=ds,Model=m,N=n,Events=sum(y),Prevalence=rho,
+                                               Metric=metric,Estimate=point$values[[metric]],CI_low=ci["low"],CI_high=ci["high"],
+                                               Ideal=ideals[[metric]],Bootstrap_requested=B,Bootstrap_valid=ci["valid"],
+                                               Status=if(point_valid && all(is.finite(ci[c("low","high")]))) "OK" else "CHECK: estimate or CI unavailable",
+                                               Evaluation_role=role,Run_scope=scope,row.names=NULL)
+      }
+      diagnostic_count=diagnostic_count+1L
+      diagnostics[[diagnostic_count]]=data.frame(DataSet=ds,Model=m,Probabilities_clipped_for_logit=point$logit_clipped,
+                                                 LOWESS_values_clipped_to_unit_interval=point$smooth_clipped,Point_estimate_issues=point$issue,
+                                                 Bootstrap_replicates_with_calibration_issues=issue_count,Run_scope=scope)
+      if(m==selected_model) write.csv(data.frame(Predicted_probability=p,LOWESS_calibrated_probability=point$smooth),
+                                      file.path(out,paste0(ds,"_Selected_model_LOWESS_curve.csv")),row.names=FALSE)
+      high=outer(p,pt,`>`)
+      tp=high*y;fp=high*(1-y)
+      tp_boot=crossprod(tp,counts)/n;fp_boot=crossprod(fp,counts)/n
+      nb=colMeans(tp)-colMeans(fp)*w
+      nb_boot=tp_boot-fp_boot*w
+      delta_all=nb_boot-all_boot
+      for(j in seq_along(pt)) {
+        ci=r7_ci(nb_boot[j,],B);ci_all=r7_ci(delta_all[j,],B)
+        snb_ci=r7_ci(nb_boot[j,]/prevalence_boot,B)
+        dca_count=dca_count+1L
+        dca_rows[[dca_count]]=data.frame(DataSet=ds,Model=m,Threshold=pt[j],
+                                         Net_benefit=nb[j],NB_CI_low=ci["low"],NB_CI_high=ci["high"],
+                                         Standardized_NB=nb[j]/rho,sNB_CI_low=snb_ci["low"],sNB_CI_high=snb_ci["high"],
+                                         Assess_all_NB=nb_all[j],Assess_none_NB=0,
+                                         Difference_vs_all=nb[j]-nb_all[j],Difference_vs_all_CI_low=ci_all["low"],Difference_vs_all_CI_high=ci_all["high"],
+                                         Difference_vs_none=nb[j],Difference_vs_none_CI_low=ci["low"],Difference_vs_none_CI_high=ci["high"],
+                                         TP=sum(tp[,j]),FP=sum(fp[,j]),Additional_assessments_per_100=100*mean(high[,j]),
+                                         False_positive_weight=w[j],False_positives_per_true_positive=(1-pt[j])/pt[j],
+                                         Is_illustrative_threshold=any(abs(pt[j]-R1C7_DCA_EXAMPLES)<1e-12),
+                                         Is_models_fixed_classification_threshold=abs(pt[j]-fixed_thresholds[[m]])<1e-12,
+                                         Bootstrap_valid=ci["valid"],DCA_positive_rule="Probability > threshold (rmda convention)",
+                                         Evaluation_role=role,Run_scope=scope,row.names=NULL)
+      }
+      message("第7条：",ds," / ",m," 的校准与净获益区间完成（",B,"次bootstrap）")
+    }
+  }
+  cal=do.call(rbind,metric_rows);dca=do.call(rbind,dca_rows);diag=do.call(rbind,diagnostics)
+  write.csv(cal,file.path(out,"R1C7_Calibration_all_models_95CI.csv"),row.names=FALSE)
+  write.csv(diag,file.path(out,"R1C7_Calibration_diagnostics.csv"),row.names=FALSE)
+  saveRDS(bootstrap_values,file.path(out,"R1C7_Calibration_bootstrap_values.rds"))
+  selected=subset(cal,Model==selected_model & DataSet!="Train")
+  write.csv(selected,file.path(out,"R1C7_Selected_model_calibration_95CI.csv"),row.names=FALSE)
+  formatted=do.call(rbind,lapply(split(selected,selected$DataSet),function(z) {
+    r=data.frame(Cohort=z$DataSet[1],Model=selected_model)
+    for(mm in names(ideals)) {
+      zz=z[z$Metric==mm,]
+      r[[mm]]=if(all(is.finite(unlist(zz[c("Estimate","CI_low","CI_high")]))))
+        sprintf("%.3f (%.3f to %.3f)",zz$Estimate,zz$CI_low,zz$CI_high) else "Not estimable; see diagnostics"
+    }
+    r
+  }))
+  write.csv(formatted,file.path(out,"R1C7_Selected_model_table_for_manuscript.csv"),row.names=FALSE)
+  write.csv(dca,file.path(out,"R1C7_DCA_all_models_pointwise_95CI.csv"),row.names=FALSE)
+  write.csv(subset(dca,Model==selected_model & DataSet!="Train" & Is_illustrative_threshold),
+            file.path(out,"R1C7_Selected_model_DCA_illustrative_thresholds.csv"),row.names=FALSE)
+  write.csv(subset(dca,Is_models_fixed_classification_threshold),
+            file.path(out,"R1C7_DCA_at_fixed_classification_thresholds.csv"),row.names=FALSE)
+  action=data.frame(Threshold=R1C7_DCA_EXAMPLES,
+                    Trigger=paste0("Predicted subsequent-sepsis risk > ",100*R1C7_DCA_EXAMPLES,"% at 24h landmark"),
+                    Action=R1C7_ACTION,FP_weight=R1C7_DCA_EXAMPLES/(1-R1C7_DCA_EXAMPLES),
+                    FP_per_TP=(1-R1C7_DCA_EXAMPLES)/R1C7_DCA_EXAMPLES,Status=R1C7_ACTION_STATUS)
+  write.csv(action,file.path(out,"R1C7_DCA_action_and_threshold_interpretation.csv"),row.names=FALSE)
+  writeLines(c(
+    paste("Run scope:",scope),paste("Bootstrap replicates:",B),
+    "Intercept = calibration-in-the-large from logit P(Y=1)=a+offset(logit(original risk)); slope fixed at 1.",
+    "Slope = b from logit P(Y=1)=a+b*logit(original risk), with intercept freely estimated.",
+    "Probabilities clipped to [1e-6,1-1e-6] only for logit-based metrics; original risks retained for Brier, ICI and DCA.",
+    "ICI = mean absolute difference between original probabilities and bounded LOWESS calibrated probabilities (span 2/3, iter=0).",
+    "ICI smoothing is refitted within each bootstrap resample. This is a calibration diagnostic, not recalibration of model predictions.",
+    "CIs are percentile intervals conditional on fitted models; no full development-pipeline refitting or optimism correction is performed here.",
+    "Bootstrap samples are unstratified to allow event prevalence to vary; models within a cohort share bootstrap indices.",
+    "CI unavailable if fewer than 95% of replicates are finite. Consult diagnostics rather than replacing failures with zero.",
+    "Numerical GLM warnings are logged; finite, full-rank converged fits are retained unless complete/quasi separation is detected.",
+    "Training entries are apparent performance; do not describe them as independent validation.",
+    "Record bootstrap assumes independent units. MIMIC has one retained record per subject; eICU person-level repeats remain unverified.",
+    "Brier reflects overall probability accuracy, not calibration alone; its magnitude also depends on event prevalence.",
+    paste("Proposed clinical action:",R1C7_ACTION),paste("Clinical status:",R1C7_ACTION_STATUS),
+    "At any threshold the action is the same; the threshold changes the assumed harm/benefit trade-off and the patients alerted.",
+    "Assess all = additional model-independent review for all; assess none = no model-triggered additional review. Routine ICU care is never withheld.",
+    "No prophylactic antibiotics or other treatment is automatically initiated solely from this predicted future risk.",
+    "0.10/0.20/0.30 are illustrative scenarios, not validated clinical cutoffs or a data-selected optimal range.",
+    "The fixed Youden classification threshold is a statistical operating point, not automatically a clinical intervention threshold.",
+    "DCA uses existing unrecalibrated probabilities. NB and pairwise NB differences have pointwise, not simultaneous, CIs.",
+    "DCA follows rmda: risk > threshold. Table 2 retains risk >= fixed threshold; the boundary convention differs only at exact ties.",
+    "Do not choose thresholds by maximizing external-cohort net benefit. No threshold recommendation is generated.",
+    "Net benefit is a modeled utility under assumed preferences; it does not demonstrate prevented sepsis, improved survival, or a causal treatment effect.",
+    "Existing three-bin calibration and DCA plots are retained unchanged; the new CIs are in separate tables, not added to the old plots."
+  ),file.path(out,"R1C7_Methods_and_interpretation.txt"))
+  if(any(cal$Status!="OK")) warning("部分校准指标/CI不可估计，详见R1C7_Calibration_diagnostics.csv")
+  message("第7条补充完成：",normalizePath(out,winslash="/"))
+  invisible(out)
+}
+if(RUN_R1C7) {
+  R1C7_OUTPUT_DIR=r7_export(datalist,selected_model,fixed_thresholds,OUTPUT_DIR,
+                            smoke_test=SMOKE_TEST,B=R1C7_BOOTSTRAPS,seed=R1C7_BOOT_SEED)
+}
+MODEL_TO_PLOT <- NULL
+DRAW_DEPENDENCE <- TRUE
+CASE_ROWS <- NULL
+CASE_FEATURES <- NULL
+FORCE_MAX_DISPLAY <- 6L
+WATERFALL_MAX_DISPLAY <- 10L
+FORCE_WIDTH <- 8; FORCE_HEIGHT <- 6
+WATERFALL_WIDTH <- 5; WATERFALL_HEIGHT <- 5
+replot_saved_shap <- function(result_dir, model = NULL, case_rows = NULL,
+                              draw_dependence = TRUE, case_features = NULL,
+                              force_max_display = 6L, waterfall_max_display = 10L,
+                              force_width = 8, force_height = 6,
+                              waterfall_width = 5, waterfall_height = 5,
+                              output_parent = result_dir) {
+  for (pkg in c("shapviz", "ggplot2")) {
+    if (!requireNamespace(pkg, quietly = TRUE)) stop("请先安装R包：", pkg)
+  }
+  result_dir <- normalizePath(result_dir, winslash = "/", mustWork = TRUE)
+  model_file <- file.path(result_dir, "Selected_model.txt")
+  if (!file.exists(model_file)) stop("找不到Selected_model.txt，无法确认主模型。")
+  selected_primary <- trimws(readLines(model_file, warn = FALSE, encoding = "UTF-8"))
+  selected_primary <- selected_primary[nzchar(selected_primary)]
+  if (length(selected_primary) != 1L) stop("Selected_model.txt必须且只能包含一个主模型名称。")
+  if (is.null(model)) {
+    model <- selected_primary
+  }
+  if (length(model) != 1L || is.na(model) || !grepl("^[A-Za-z0-9_]+$", model))
+    stop("MODEL_TO_PLOT必须是一个模型名称，例如Logistic、NeuralNetwork、LightGBM。")
+  if (!identical(model, selected_primary))
+    stop("当前配置只允许重绘Selected_model.txt指定的主模型SHAP。")
+  shap_file <- file.path(result_dir, paste0("SHAP_", model, "_values.rds"))
+  if (!file.exists(shap_file)) stop("找不到已保存的SHAP结果：", shap_file,
+                                    "\n请确认选择了本次分析结果文件夹，且已运行SHAP部分。")
+  saved <- readRDS(shap_file)
+  sv <- if (inherits(saved, "shapviz")) saved else saved[["Yes"]]
+  if (!inherits(sv, "shapviz")) stop("SHAP文件不是shapviz对象，也没有Yes类别对象。")
+  if (!is.matrix(sv$S) || any(!is.finite(sv$S)) || !nrow(sv$S) || !ncol(sv$S))
+    stop("SHAP矩阵为空或包含无效值。")
+  if (!identical(colnames(sv$S), names(sv$X)) || nrow(sv$S) != nrow(sv$X))
+    stop("SHAP矩阵与特征数据不一致。")
+  if (anyDuplicated(names(sv$X))) stop("特征名称重复。")
+  n <- nrow(sv$S)
+  if (is.null(case_rows)) {
+    selected_case_file <- file.path(result_dir,"SHAP_selected_case.csv")
+    if (!file.exists(selected_case_file))
+      stop("找不到SHAP_selected_case.csv，无法自动读取目标概率病例。")
+    selected_case <- read.csv(selected_case_file,check.names=FALSE)
+    if (!all(c("Model","Training_row","Target_probability","Predicted_probability") %in% names(selected_case)) ||
+        nrow(selected_case)!=1L || selected_case$Model[1]!=model)
+      stop("SHAP_selected_case.csv与当前主模型或目标概率配置不一致。")
+    case_rows <- selected_case$Training_row[1]
+  }
+  if (!is.numeric(case_rows) || anyNA(case_rows) ||
+      any(!is.finite(case_rows) | case_rows != floor(case_rows) | case_rows < 1 | case_rows > n))
+    stop("CASE_ROWS必须是1至", n, "之间的整数行号；只导出选样表可用integer(0)。")
+  case_rows <- unique(as.integer(case_rows))
+  valid_display <- function(x) is.numeric(x) && length(x) == 1L && !is.na(x) &&
+    x >= 1 && (is.infinite(x) || x == floor(x))
+  if (!valid_display(force_max_display) || !valid_display(waterfall_max_display))
+    stop("max_display必须是正整数或Inf。")
+  sizes <- c(force_width, force_height, waterfall_width, waterfall_height)
+  if (!is.numeric(sizes) || length(sizes) != 4L || any(!is.finite(sizes) | sizes <= 0))
+    stop("图片宽度和高度必须为正数，单位是英寸。")
+  importance <- shapviz::sv_importance(sv, kind = "no")
+  features <- names(importance)
+  if (!is.null(case_features)) {
+    if (!is.character(case_features) || !length(case_features) || anyNA(case_features))
+      stop("CASE_FEATURES应为NULL，或一个非空的特征名称向量。")
+    case_features <- unique(case_features)
+    if (!all(case_features %in% features))
+      stop("这些特征不在当前模型中：", paste(setdiff(case_features, features), collapse = ", "))
+  }
+  ranking <- data.frame(Rank = seq_along(features), Feature = features,
+                        Mean_abs_SHAP = as.numeric(importance))
+  index <- data.frame(SHAP_row = seq_len(n), SHAP_output = rowSums(sv$S) + sv$baseline)
+  index <- cbind(index, sv$X)
+  mapping_note <- "SHAP_row仅指该SHAP对象的行号，不是患者ID或原始CSV行号。"
+  results_file <- file.path(result_dir, "R1C4_predictions_and_results.rds")
+  dev_file <- file.path(result_dir, "dev.csv")
+  if (file.exists(results_file) && file.exists(dev_file)) {
+    rr <- readRDS(results_file)
+    train <- rr$predictions$Train
+    dd <- read.csv(dev_file, check.names = FALSE)
+    aligned <- is.data.frame(train) && nrow(train) == nrow(dd) && nrow(dd) >= n &&
+      all(names(sv$X) %in% names(dd)) && model %in% names(train)
+    if (aligned) aligned <- all(vapply(names(sv$X), function(nm) {
+      a <- sv$X[[nm]]; b <- dd[[nm]][seq_len(n)]
+      if (is.numeric(a)) isTRUE(all.equal(a, as.numeric(b), tolerance = 1e-7,
+                                          check.attributes = FALSE)) else
+                                            identical(as.character(a), as.character(b))
+    }, logical(1)))
+    if (!aligned) stop("SHAP对象与dev.csv/训练预测的行顺序或内容不一致，请勿混用不同运行结果。")
+    scale <- "probability"
+    expected <- index$SHAP_output
+    prob <- train[[model]][seq_len(n)]
+    if (any(!is.finite(prob)) || max(abs(expected - prob)) > 1e-6)
+      stop("SHAP加和与已保存预测不一致，请检查模型、解释尺度及结果来源。")
+    index <- cbind(data.frame(SHAP_row = seq_len(n), Training_row = seq_len(n),
+                              Observed_Result = train$Result[seq_len(n)],
+                              Predicted_probability = prob, SHAP_scale = scale),
+                   index[, setdiff(names(index), "SHAP_row"), drop = FALSE])
+    mapping_note <- paste("已核验特征与训练预测；SHAP_row对应dev.csv的数据行（不计表头）。",
+                          "SHAP坐标尺度：", scale, "。")
+    manifest_file <- file.path(result_dir, "MIMICIV_split_manifest.csv")
+    if (file.exists(manifest_file)) {
+      mm <- read.csv(manifest_file, colClasses = "character", check.names = FALSE)
+      need <- c("Source_row", "Patient_ID", "Stay_ID", "Split")
+      if (all(need %in% names(mm)) &&
+          identical(as.integer(which(mm$Split == "Train")), as.integer(rr$split_indices)) &&
+          sum(mm$Split == "Train") == nrow(dd)) {
+        id_columns <- mm[mm$Split == "Train", c("Patient_ID", "Stay_ID", "Source_row"), drop = FALSE]
+        index <- cbind(index[, 1:2], id_columns[seq_len(n), , drop = FALSE],
+                       index[, -(1:2), drop = FALSE])
+      }
+    }
+  }
+  case_sv <- sv
+  grouped <- character(0)
+  if (!is.null(case_features)) {
+    grouped <- setdiff(features, case_features)
+    S_case <- sv$S[, case_features, drop = FALSE]
+    X_case <- sv$X[, case_features, drop = FALSE]
+    if (length(grouped)) {
+      group_name <- "Other features"
+      while (group_name %in% features) group_name <- paste0(group_name, "_")
+      S_case <- cbind(S_case, rowSums(sv$S[, grouped, drop = FALSE]))
+      colnames(S_case)[ncol(S_case)] <- group_name
+      X_case[[group_name]] <- "combined"
+    }
+    case_sv <- shapviz::shapviz(S_case, X = X_case, baseline = sv$baseline)
+    stopifnot(max(abs(rowSums(case_sv$S) - rowSums(sv$S))) < 1e-10)
+    force_max_display <- Inf
+    waterfall_max_display <- Inf
+  }
+  dir.create(output_parent, recursive = TRUE, showWarnings = FALSE)
+  out <- file.path(output_parent, paste0("SHAP_custom_", model, "_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+  initial_out <- out; suffix <- 1L
+  while (file.exists(out)) { out <- paste0(initial_out, "_", suffix); suffix <- suffix + 1L }
+  if (!dir.create(out, recursive = TRUE)) stop("无法创建输出文件夹：", out)
+  write.csv(ranking, file.path(out, "SHAP_feature_ranking.csv"), row.names = FALSE)
+  write.csv(index, file.path(out, "SHAP_sample_index.csv"), row.names = FALSE)
+  plot_pdf <- function(p, file, width, height) {
+    grDevices::pdf(file, width = width, height = height)
+    on.exit(grDevices::dev.off(), add = TRUE)
+    print(p)
+  }
+  file_safe <- function(x) gsub("[^A-Za-z0-9_.-]", "_", x)
+  if (isTRUE(draw_dependence)) for (j in seq_along(features)) {
+    v <- features[j]
+    p <- shapviz::sv_dependence(sv, v = v, color = "#3b528b", color_var = v) +
+      ggplot2::theme_bw() + ggplot2::ggtitle(model) +
+      ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold", color = "black"))
+    plot_pdf(p, file.path(out, sprintf("SHAP_%s_dependence_%02d_%s.pdf", model, j, file_safe(v))), 5, 5)
+  }
+  case_details <- list()
+  for (r in case_rows) {
+    stem <- sprintf("SHAP_%s_case_%04d", model, r)
+    p <- shapviz::sv_force(case_sv, row_id = r, max_display = force_max_display, size = 9) +
+      ggplot2::ggtitle(model) +
+      ggplot2::theme(plot.margin = ggplot2::margin(5.5, 12, 5.5, 12),
+                     plot.title = ggplot2::element_text(hjust = 0.5, face = "bold", color = "black"))
+    plot_pdf(p, file.path(out, paste0(stem, "_force.pdf")), force_width, force_height)
+    p <- shapviz::sv_waterfall(case_sv, row_id = r, max_display = waterfall_max_display,
+                               fill_colors = c("#f7d13d", "#a52c60")) +
+      ggplot2::theme_bw() + ggplot2::ggtitle(model) +
+      ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold", color = "black"))
+    plot_pdf(p, file.path(out, paste0(stem, "_waterfall.pdf")), waterfall_width, waterfall_height)
+    ord <- order(abs(sv$S[r, ]), decreasing = TRUE)
+    case_details[[as.character(r)]] <- data.frame(SHAP_row = r,
+                                                  Feature = colnames(sv$S)[ord], Value = vapply(sv$X[ord], function(x) as.character(x[r]), character(1)),
+                                                  SHAP_value = as.numeric(sv$S[r, ord]),
+                                                  Baseline = sv$baseline, SHAP_output = sum(sv$S[r, ]) + sv$baseline)
+  }
+  if (length(case_details)) write.csv(do.call(rbind, case_details),
+                                      file.path(out, "SHAP_selected_case_values.csv"), row.names = FALSE)
+  smoke_file <- file.path(result_dir, "Run_configuration.rds")
+  smoke <- file.exists(smoke_file) && isTRUE(readRDS(smoke_file)$smoke_test)
+  writeLines(c(if (smoke) "SMOKE TEST ONLY：此文件夹的来源是调试分析，不能作为正式结果。" else "来源：用户指定的已保存SHAP结果。",
+               paste("Model:", model), paste("Source SHAP:", shap_file), paste("SHAP samples:", n),
+               paste("Explained features:", length(features)), mapping_note,
+               paste("Target predicted probability for the waterfall case:",SHAP_TARGET_PROBABILITY),
+               "The selected case is the real training observation whose predicted probability is closest to the target; f(x) is not overwritten.",
+               "依赖图是SHAP dependence plot，不是偏依赖图/PDP，也不是因果效应图。",
+               "仅遍历该模型SHAP对象内的全部入选特征，不包含被筛除的候选特征。",
+               "默认格式沿用最新代码的主模型SHAP图；所有新增图单独保存，不覆盖原图。",
+               "CASE_ROWS一次循环一人；多个行号不会求平均。",
+               paste("Explicit case features:", if (is.null(case_features)) "NULL (all available)" else paste(case_features, collapse = ", ")),
+               paste("Grouped as Other features:", paste(grouped, collapse = ", ")),
+               "指定部分特征时，其余SHAP贡献合并为Other features；不丢弃贡献，不改变预测。",
+               "展示案例应明确为解释性示例，不应因选择了某病例而宣称模型总体准确。"),
+             file.path(out, "SHAP_plot_notes.txt"), useBytes = TRUE)
+  saveRDS(list(model = model, case_rows = case_rows, case_features = case_features,
+               force_max_display = force_max_display, waterfall_max_display = waterfall_max_display,
+               target_probability = SHAP_TARGET_PROBABILITY,
+               source_md5 = tools::md5sum(shap_file), grouped_features = grouped,
+               shapviz_version = as.character(utils::packageVersion("shapviz"))),
+          file.path(out, "SHAP_plot_configuration.rds"))
+  message("SHAP补画完成：", normalizePath(out, winslash = "/"))
+  invisible(list(output_dir = out, model = model, ranking = ranking,
+                 sample_index = index, case_sv = case_sv))
+}
+RESULT_DIR <- OUTPUT_DIR
+if (RUN_SHAP) {
+  replot_saved_shap(
+    result_dir = RESULT_DIR, model = MODEL_TO_PLOT,
+    case_rows = CASE_ROWS, draw_dependence = DRAW_DEPENDENCE,
+    case_features = CASE_FEATURES,
+    force_max_display = FORCE_MAX_DISPLAY, waterfall_max_display = WATERFALL_MAX_DISPLAY,
+    force_width = FORCE_WIDTH, force_height = FORCE_HEIGHT,
+    waterfall_width = WATERFALL_WIDTH, waterfall_height = WATERFALL_HEIGHT
+  )
+} else {
+  message("RUN_SHAP=FALSE，未执行新增SHAP补画。")
+}
+RESULT_DIR <- OUTPUT_DIR
+RAW_MIMIC4_FILE <- file.path(RAW_DATA_DIR, "mimic4.csv")
+PLOT_OUTPUT_DIR <- file.path(RESULT_DIR, "LambdaMin_feature_selection_plots")
+DRAW_VENN <- TRUE
+BORUTA_CONFIRMED_ONLY <- TRUE
+LASSO_X_AXIS <- "reference_lambda"
+BORUTA_WIDTH <- 5.306
+BORUTA_HEIGHT <- 3.931
+LASSO1_WIDTH <- 5.5
+LASSO1_HEIGHT <- 5.5
+LASSO2_WIDTH <- 7.084
+LASSO2_HEIGHT <- 5.903
+TEXT_SCALE <- 1
+redraw_lambda_min_selection <- function(result_dir, raw_file, output_dir,
+                                        draw_venn = TRUE, confirmed_only = TRUE,
+                                        x_axis = "reference_lambda", text_scale = 1,
+                                        boruta_width = 5.306, boruta_height = 3.931,
+                                        lasso1_width = 5.5, lasso1_height = 5.5,
+                                        lasso2_width = 7.084, lasso2_height = 5.903) {
+  rng_before <- RNGkind()
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) seed_before <- get(".Random.seed", envir = .GlobalEnv)
+  on.exit({
+    do.call(RNGkind, as.list(rng_before))
+    if (had_seed) assign(".Random.seed", seed_before, envir = .GlobalEnv)
+    else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+      rm(list = ".Random.seed", envir = .GlobalEnv)
+  }, add = TRUE)
+  RNGkind("Mersenne-Twister", "Inversion", "Rejection")
+  fail <- function(...) stop(..., call. = FALSE)
+  eq_num <- function(a, b, tol = 1e-10) {
+    isTRUE(all.equal(as.numeric(a), as.numeric(b), tolerance = tol,
+                     check.attributes = FALSE))
+  }
+  if (!x_axis %in% c("reference_lambda", "log_ratio"))
+    fail("LASSO_X_AXIS只能是reference_lambda或log_ratio。")
+  if (!is.numeric(text_scale) || length(text_scale) != 1L ||
+      !is.finite(text_scale) || text_scale <= 0) fail("TEXT_SCALE必须大于0。")
+  required <- c("glmnet", "Boruta", "fru", "ggplot2")
+  if (draw_venn) required <- c(required, "VennDiagram")
+  missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) fail("缺少R包：", paste(missing, collapse = ", "),
+                            "。请使用原分析的软件环境；脚本不会自动安装或升级。")
+  paths <- c(preprocess = file.path(result_dir, "Final_preprocess.rds"),
+             config = file.path(result_dir, "Run_configuration.rds"),
+             candidates = file.path(result_dir, "Candidate_predictors.csv"),
+             split = file.path(result_dir, "MIMICIV_split_manifest.csv"),
+             features = file.path(result_dir, "Pipeline_audit", "FinalRefit_features.csv"),
+             dev = file.path(result_dir, "dev.csv"),
+             session = file.path(result_dir, "sessionInfo.txt"),
+             raw = raw_file)
+  if (any(!file.exists(paths))) fail("缺少文件：\n", paste(paths[!file.exists(paths)], collapse = "\n"))
+  source_hashes <- setNames(tools::md5sum(unname(paths)), names(paths))
+  pp <- readRDS(paths[["preprocess"]])
+  cfg <- readRDS(paths[["config"]])
+  if (isTRUE(cfg$smoke_test)) fail("该目录是SMOKE_TEST调试结果，不能生成论文最终筛选图。")
+  if (identical(cfg$analysis_mode, "FIXED11")) fail("该目录是固定11项分析；请改为lambda.min完整折内筛选结果目录。")
+  if (!identical(cfg$lasso_selection_rule, "lambda.min") ||
+      !identical(pp$lasso_selection_rule, "lambda.min"))
+    fail("结果不是本次lambda.min主代码生成的完整折内筛选结果。请先从头重跑主代码，不能修改旧RDS标签绕过检查。")
+  fields <- c("imputer", "features", "boruta", "lasso", "boruta_decisions",
+              "lambda_ratio", "lambda", "lasso_cv", "seed", "training_source_rows", "training_patients")
+  if (!all(fields %in% names(pp))) fail("保存对象缺少完整筛选字段，不适用于本脚本。")
+  if (!length(pp$features) || anyNA(pp$features) || anyDuplicated(pp$features) ||
+      !all(pp$features %in% pp$imputer$keep))
+    fail("保存的最终变量名单为空、重复或不属于可用候选变量。")
+  if (!setequal(intersect(pp$boruta, pp$lasso), pp$features))
+    fail("保存的Boruta/LASSO交集与最终变量名单不一致。")
+  old_session <- paste(readLines(paths[["session"]], warn = FALSE), collapse = " ")
+  versions <- data.frame(Package = required,
+                         Current_version = vapply(required, function(p) as.character(utils::packageVersion(p)), character(1)))
+  versions$Original_version <- vapply(required, function(p) {
+    token <- regmatches(old_session, regexec(paste0("\\b", p, "_([^[:space:]]+)"), old_session))[[1]]
+    if (length(token) >= 2L) token[2] else NA_character_
+  }, character(1))
+  normalize_version <- function(z) gsub("-", ".", z, fixed = TRUE)
+  core <- versions$Package %in% c("glmnet", "Boruta", "fru")
+  mismatch <- core & (is.na(versions$Original_version) |
+                        normalize_version(versions$Original_version) != normalize_version(versions$Current_version))
+  if (any(mismatch)) fail("用于重现筛选的包版本与原分析不一致：\n",
+                          paste(capture.output(print(versions[mismatch, ], row.names = FALSE)), collapse = "\n"),
+                          "\n请恢复原分析版本，不要用不同版本生成另一套筛选结果。")
+  candidate_info <- read.csv(paths[["candidates"]], check.names = FALSE, stringsAsFactors = FALSE)
+  if (!all(c("Feature", "Binary") %in% names(candidate_info))) fail("候选变量文件格式不正确。")
+  candidate_features <- as.character(candidate_info$Feature)
+  binary_features <- candidate_features[as.logical(candidate_info$Binary)]
+  if (!identical(candidate_features, cfg$candidate_features)) fail("候选名单与原运行配置不一致。")
+  if (anyNA(candidate_info$Binary) || anyDuplicated(candidate_features)) fail("候选变量的类型或名称无效。")
+  saved_hash_names <- basename(gsub("\\\\", "/", names(cfg$source_md5)))
+  source_idx <- which(saved_hash_names == "mimic4.csv")
+  if (length(source_idx) != 1L ||
+      !identical(unname(as.character(cfg$source_md5[source_idx])), unname(as.character(source_hashes[["raw"]]))))
+    fail("mimic4.csv与完成本次lambda.min分析时的原始文件不一致。补图前应恢复同一输入，不能混用修改后的数据。")
+  raw <- read.csv(raw_file, check.names = FALSE, na.strings = c("", "NA", "NaN", "NULL"),
+                  strip.white = TRUE, fileEncoding = "GB18030")
+  if ("HGB" %in% names(raw) && !"HB" %in% names(raw)) names(raw)[names(raw) == "HGB"] <- "HB"
+  required_cols <- c("Result", candidate_features)
+  if (!all(required_cols %in% names(raw))) fail("原始数据缺列：", paste(setdiff(required_cols, names(raw)), collapse = ", "))
+  rows <- pp$training_source_rows
+  if (anyNA(rows) || anyDuplicated(rows) || any(rows < 1 | rows > nrow(raw)) ||
+      any(rows != as.integer(rows))) fail("保存的训练行号无效。")
+  train <- raw[as.integer(rows), , drop = FALSE]
+  has_raw_ids <- all(c("subject_id", "stay_id") %in% names(raw))
+  if (has_raw_ids) {
+    expected_patient <- as.character(train$subject_id)
+    expected_stay <- as.character(train$stay_id)
+  } else {
+    expected_patient <- paste0("MIMIC-IV_row_", rows)
+    expected_stay <- expected_patient
+  }
+  if (!identical(expected_patient, as.character(pp$training_patients)) ||
+      anyDuplicated(expected_patient)) fail("训练记录或顺序与保存的最终筛选对象不一致。")
+  split <- read.csv(paths[["split"]], colClasses = "character", check.names = FALSE)
+  ii <- match(as.character(rows), split$Source_row)
+  if (anyNA(ii) || !all(split$Split[ii] == "Train") ||
+      !identical(expected_stay, split$Stay_ID[ii]) ||
+      !identical(expected_patient, split$Patient_ID[ii]) ||
+      !setequal(as.character(rows), split$Source_row[split$Split == "Train"]))
+    fail("训练记录与MIMIC-IV拆分清单不一致。程序不会重新随机拆分。")
+  for (nm in c("Result", candidate_features)) {
+    old <- train[[nm]]
+    z <- suppressWarnings(as.numeric(as.character(old)))
+    if (any(is.na(z) & !is.na(old)) || any(is.infinite(z))) fail("训练数据存在非数值内容或无穷值：", nm)
+    train[[nm]] <- z
+  }
+  if (anyNA(train$Result) || !all(train$Result %in% 0:1)) fail("训练结局不是完整的0/1。")
+  for (nm in binary_features)
+    if (!all(na.omit(train[[nm]]) %in% 0:1)) fail("二分类变量编码不是0/1：", nm)
+  y <- factor(train$Result, levels = 0:1, labels = c("No", "Yes"))
+  x_raw <- train[, candidate_features, drop = FALSE]
+  missing_rate <- vapply(x_raw, function(z) mean(is.na(z)), numeric(1))
+  keep <- names(x_raw)[missing_rate <= cfg$missing_limit & missing_rate < 1]
+  fills <- vapply(keep, function(nm) {
+    z <- na.omit(x_raw[[nm]])
+    if (nm %in% binary_features) as.numeric(names(sort(table(z), decreasing = TRUE))[1]) else median(z)
+  }, numeric(1))
+  tmp <- x_raw[, keep, drop = FALSE]
+  for (nm in keep) tmp[[nm]][is.na(tmp[[nm]])] <- fills[[nm]]
+  varying <- vapply(tmp, function(z) length(unique(z)) > 1L, logical(1))
+  keep <- keep[varying]
+  fills <- fills[keep]
+  if (!identical(keep, pp$imputer$keep) || !eq_num(fills, pp$imputer$fill) ||
+      !eq_num(missing_rate, pp$imputer$missing)) fail("最终训练集的缺失处理无法重现保存对象。")
+  x <- x_raw[, pp$imputer$keep, drop = FALSE]
+  for (nm in names(x)) x[[nm]][is.na(x[[nm]])] <- pp$imputer$fill[[nm]]
+  if (anyNA(x)) fail("使用原插补值后仍有缺失。")
+  old_dev <- read.csv(paths[["dev"]], check.names = FALSE, stringsAsFactors = FALSE)
+  if (nrow(old_dev) != nrow(x) || !identical(as.character(old_dev$Result), as.character(y)) ||
+      !all(pp$features %in% names(old_dev)) ||
+      !eq_num(as.matrix(old_dev[, pp$features, drop = FALSE]), as.matrix(x[, pp$features, drop = FALSE])))
+    fail("最终输入或结局与已用于建模的dev.csv不一致。")
+  message("原始文件、", nrow(x), "条训练记录和插补结果核对通过；不使用内部测试/外部队列拟合。")
+  cv <- pp$lasso_cv
+  if (!all(c("Ratio", "Mean_deviance", "SE", "Selected") %in% names(cv)) ||
+      anyNA(cv) || any(!is.finite(as.matrix(cv[, c("Ratio", "Mean_deviance", "SE")]))))
+    fail("保存的LASSO辅助CV曲线无效。")
+  if (!eq_num(cv$Ratio, exp(seq(log(1), log(0.0001), length.out = 60L))) ||
+      any(cv$SE < 0) || sum(as.logical(cv$Selected)) != 1L) fail("LASSO搜索网格或选择标记与本版流程不符。")
+  index_min <- which.min(cv$Mean_deviance)
+  index_1se <- which(cv$Mean_deviance <= cv$Mean_deviance[index_min] + cv$SE[index_min])[1]
+  index_selected <- index_min
+  if (!identical(index_selected, which(as.logical(cv$Selected))) ||
+      !eq_num(cv$Ratio[index_selected], pp$lambda_ratio))
+    fail("保存的LASSO选择不符合lambda.min最小平均二项偏差规则。")
+  pilot <- glmnet::glmnet(as.matrix(x), as.integer(y == "Yes"), family = "binomial",
+                          alpha = 1, standardize = TRUE, nlambda = 20)
+  lambda_max <- pilot$lambda[1]
+  lambda_grid <- lambda_max * cv$Ratio
+  lasso_fit <- glmnet::glmnet(as.matrix(x), as.integer(y == "Yes"), family = "binomial",
+                              alpha = 1, standardize = TRUE, lambda = lambda_grid)
+  coef_path <- as.matrix(stats::coef(lasso_fit, s = lambda_grid))
+  coef_selected <- coef_path[, index_selected]
+  lasso_names <- setdiff(rownames(coef_path)[coef_selected != 0], "(Intercept)")
+  if (!eq_num(lambda_grid[index_selected], pp$lambda) || !identical(lasso_names, pp$lasso))
+    fail("LASSO路径未重现原惩罚参数/变量名单，停止绘图；不要仅修改线的位置。")
+  message("LASSO路径核对通过：", length(lasso_names), "项；直接使用原辅助CV结果。")
+  message("正在重现最终训练集的Boruta重要性历史，请等待；不进行九模型训练。")
+  set.seed(pp$seed)
+  bo <- Boruta::Boruta(x = x, y = y, maxRuns = cfg$boruta_max_runs, doTrace = 0,
+                       holdHistory = TRUE, num.threads = 2)
+  if (any(bo$finalDecision == "Tentative")) bo <- Boruta::TentativeRoughFix(bo)
+  boruta_names <- names(bo$finalDecision)[bo$finalDecision == "Confirmed"]
+  selected <- names(x)[names(x) %in% intersect(boruta_names, lasso_names)]
+  if (!identical(boruta_names, pp$boruta) || !identical(selected, pp$features) ||
+      !identical(names(bo$finalDecision), names(pp$boruta_decisions)) ||
+      !identical(as.character(bo$finalDecision), as.character(pp$boruta_decisions)))
+    fail("Boruta或最终交集没有重现原名单，停止绘图。请检查环境/原始数据，不要换种子凑数量。")
+  decision <- read.csv(paths[["features"]], check.names = FALSE, stringsAsFactors = FALSE)
+  if (!identical(as.character(decision$Feature), candidate_features) ||
+      !identical(as.logical(decision$Boruta), candidate_features %in% boruta_names) ||
+      !identical(as.logical(decision$LASSO), candidate_features %in% lasso_names) ||
+      !identical(as.logical(decision$Intersection), candidate_features %in% selected))
+    fail("最终筛选CSV与重现对象不一致。")
+  message("一致性检查全部通过：Boruta ", length(boruta_names), "项，LASSO ",
+          length(lasso_names), "项，交集", length(selected), "项；lambda.min；开始绘图。")
+  result_norm <- normalizePath(result_dir, winslash = "/", mustWork = TRUE)
+  output_norm <- normalizePath(output_dir, winslash = "/", mustWork = FALSE)
+  if (tolower(output_norm) %in% tolower(c(result_norm, dirname(normalizePath(raw_file, winslash = "/")))))
+    fail("请使用单独的补图子目录，不要直接输出到结果根目录或原始数据目录。")
+  if (dir.exists(output_dir) && length(list.files(output_dir, all.files = FALSE)))
+    output_dir <- paste0(output_dir, "_", format(Sys.time(), "%Y%m%d_%H%M%S"))
+  if (dir.exists(output_dir) && length(list.files(output_dir, all.files = FALSE))) fail("输出目录仍非空，请更换PLOT_OUTPUT_DIR。")
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  if (!dir.exists(output_dir)) fail("无法建立补图目录：", output_dir)
+  output_dir <- normalizePath(output_dir, winslash = "/", mustWork = TRUE)
+  beta <- coef_path[rownames(coef_path) != "(Intercept)", , drop = FALSE]
+  nnz <- colSums(beta != 0)
+  x_values <- if (x_axis == "reference_lambda") log(lambda_grid) else log(cv$Ratio)
+  x_label <- if (x_axis == "reference_lambda") "Log_Lambda" else "Log(lambda / lambda_max)"
+  path_data <- data.frame(Feature = rep(rownames(beta), times = ncol(beta)),
+                          X = rep(x_values, each = nrow(beta)), Coefficient = as.numeric(beta))
+  cv$Reference_lambda <- lambda_grid
+  cv$Log_reference_lambda <- log(lambda_grid)
+  cv$Log_ratio <- log(cv$Ratio)
+  cv$Nonzero_coefficients_full_training <- nnz
+  cv$X <- x_values
+  top_idx <- unique(round(seq(1, nrow(cv), length.out = 10)))
+  x_scale <- function() ggplot2::scale_x_continuous(name = x_label,
+                                                    sec.axis = ggplot2::dup_axis(name = NULL, breaks = x_values[top_idx], labels = nnz[top_idx]))
+  common_theme <- ggplot2::theme_bw(base_size = 10 * text_scale, base_family = "sans") +
+    ggplot2::theme(panel.grid = ggplot2::element_blank(),
+                   panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = .45),
+                   plot.title = ggplot2::element_text(hjust = .5, size = 13 * text_scale, margin = ggplot2::margin(b = 12)),
+                   axis.title = ggplot2::element_text(size = 9 * text_scale),
+                   axis.text = ggplot2::element_text(size = 8 * text_scale, colour = "#333333"),
+                   axis.text.x.top = ggplot2::element_text(size = 6 * text_scale),
+                   axis.ticks.x.top = ggplot2::element_blank(),
+                   legend.key = ggplot2::element_blank(),
+                   plot.margin = ggplot2::margin(28, 24, 25, 25))
+  g1 <- ggplot2::ggplot(path_data, ggplot2::aes(x = X, y = Coefficient, colour = Feature, group = Feature)) +
+    ggplot2::geom_line(linewidth = .65) + x_scale() +
+    ggplot2::labs(title = "Lasso Regression Lambda and Coefficients Plot", y = "Coefficients") +
+    common_theme + ggplot2::theme(legend.position = "none", plot.margin = ggplot2::margin(40, 45, 38, 45))
+  label_1se <- if (x_axis == "reference_lambda") sprintf("LogLambda_1se=%.3f", x_values[index_1se]) else
+    sprintf("LogRatio_1se=%.3f", x_values[index_1se])
+  label_min <- if (x_axis == "reference_lambda") sprintf("LogLambda_min=%.3f", x_values[index_min]) else
+    sprintf("LogRatio_min=%.3f", x_values[index_min])
+  marks <- data.frame(X = x_values[c(index_1se, index_min)],
+                      Rule = factor(c(label_1se, label_min), levels = c(label_1se, label_min)))
+  g2 <- ggplot2::ggplot(cv, ggplot2::aes(x = X, y = Mean_deviance)) +
+    ggplot2::geom_errorbar(ggplot2::aes(ymin = Mean_deviance - SE, ymax = Mean_deviance + SE),
+                           width = .055, linewidth = .25, colour = "black") +
+    ggplot2::geom_line(colour = "#8EBDA5", linewidth = .4) +
+    ggplot2::geom_point(colour = "#8EBDA5", size = .35) +
+    ggplot2::geom_vline(data = marks, ggplot2::aes(xintercept = X, colour = Rule),
+                        linetype = "dotted", linewidth = .5, show.legend = TRUE) +
+    ggplot2::scale_colour_manual(values = setNames(c("blue", "red"), c(label_1se, label_min)), name = NULL) +
+    x_scale() + ggplot2::labs(title = "Lasso Regression Lambda and CVM Plot", y = "CVM") +
+    common_theme + ggplot2::theme(legend.position = "right", legend.text = ggplot2::element_text(size = 8 * text_scale))
+  shadow_names <- c("shadowMax", "shadowMean", "shadowMin")
+  show_features <- if (confirmed_only) boruta_names else names(bo$finalDecision)
+  history_cols <- c(show_features, shadow_names)
+  if (is.null(bo$ImpHistory) || !all(history_cols %in% colnames(bo$ImpHistory))) fail("重现对象没有完整Boruta重要性历史。")
+  history <- bo$ImpHistory[, history_cols, drop = FALSE]
+  box_data <- data.frame(Variable = rep(colnames(history), each = nrow(history)), Importance = as.numeric(history))
+  box_data <- box_data[is.finite(box_data$Importance), , drop = FALSE]
+  medians <- tapply(box_data$Importance, box_data$Variable, stats::median)
+  box_data$Variable <- factor(box_data$Variable, levels = names(sort(medians)))
+  category <- setNames(as.character(bo$finalDecision), names(bo$finalDecision))
+  category <- c(category, setNames(shadow_names, shadow_names))
+  box_data$Decision <- factor(unname(category[as.character(box_data$Variable)]),
+                              levels = c("Confirmed", "Tentative", "Rejected", shadow_names))
+  g3 <- ggplot2::ggplot(box_data, ggplot2::aes(x = Variable, y = Importance, fill = Decision)) +
+    ggplot2::geom_boxplot(width = .5, linewidth = .3, outlier.colour = "red", outlier.size = .45, outlier.stroke = 0) +
+    ggplot2::scale_fill_manual(values = c(Confirmed = "#F8766D", Tentative = "#E6AB02", Rejected = "#999999",
+                                          shadowMax = "#7CAE00", shadowMean = "#00BFC4", shadowMin = "#C77CFF"),
+                               name = "Final Decision", drop = TRUE) +
+    ggplot2::labs(title = "Boruta Feature Filtering Each Variable Importance Box Plot", x = "Variable", y = "Importance") +
+    common_theme + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = 7.5 * text_scale),
+                                  plot.title = ggplot2::element_text(size = 10.8 * text_scale, margin = ggplot2::margin(b = 5)),
+                                  legend.text = ggplot2::element_text(size = 7.5 * text_scale),
+                                  legend.title = ggplot2::element_text(size = 8 * text_scale),
+                                  legend.key.size = grid::unit(.28, "cm"), plot.margin = ggplot2::margin(16, 6, 14, 6))
+  save_plot <- function(p, name, w, h) {
+    ggplot2::ggsave(filename = file.path(output_dir, name), plot = p,
+                    width = w, height = h, units = "in", device = grDevices::pdf,
+                    family = "Helvetica", useDingbats = FALSE, bg = "white", limitsize = FALSE)
+  }
+  save_plot(g1, "lasso1.pdf", lasso1_width, lasso1_height)
+  save_plot(g2, "lasso2.pdf", lasso2_width, lasso2_height)
+  save_plot(g3, "boruta.pdf", if (confirmed_only) boruta_width else max(boruta_width, 10), boruta_height)
+  if (draw_venn) {
+    invisible(utils::capture.output(
+      venn_plot <- VennDiagram::venn.diagram(x = list(boruta = boruta_names, lasso = lasso_names),
+                                             filename = NULL, fill = grDevices::adjustcolor(c("cyan", "red"), alpha.f = .6),
+                                             cex = 1.5, cat.cex = 1.5, cat.pos = c(10, -10), cat.dist = c(-.05, -.05),
+                                             scaled = FALSE, disable.logging = TRUE)))
+    draw_venn_pdf <- function() {
+      grDevices::pdf(file.path(output_dir, "venn.pdf"), width = 8, height = 8, useDingbats = FALSE)
+      on.exit(grDevices::dev.off(), add = TRUE)
+      grid::grid.newpage(); grid::grid.draw(venn_plot)
+    }
+    draw_venn_pdf()
+  }
+  write.csv(decision, file.path(output_dir, "Final_selection_all_candidates.csv"), row.names = FALSE)
+  write.csv(cv, file.path(output_dir, "LASSO_CV_curve_and_reference_lambda.csv"), row.names = FALSE)
+  write.csv(path_data, file.path(output_dir, "LASSO_coefficient_path.csv"), row.names = FALSE)
+  write.csv(versions, file.path(output_dir, "Software_versions.csv"), row.names = FALSE)
+  writeLines(selected, file.path(output_dir, "Final_intersection.txt"))
+  writeLines(boruta_names, file.path(output_dir, "Boruta_confirmed.txt"))
+  writeLines(lasso_names, file.path(output_dir, "LASSO_selected_lambda_min.txt"))
+  write.csv(data.frame(Boruta_only = length(setdiff(boruta_names, lasso_names)),
+                       Intersection = length(selected), LASSO_only = length(setdiff(lasso_names, boruta_names))),
+            file.path(output_dir, "Venn_counts.csv"), row.names = FALSE)
+  saveRDS(list(lasso_fit = lasso_fit, boruta_object = bo, lasso_cv = cv,
+               features = selected, boruta = boruta_names, lasso = lasso_names,
+               lambda_max = lambda_max, lambda_selected = pp$lambda, seed = pp$seed,
+               input_hashes = source_hashes, source_result_dir = result_norm,
+               n_training = nrow(x), x_axis = x_axis, lasso_selection_rule = "lambda.min",
+               note = "Final training-set screening reconstruction; no prediction model refitted; not independent validation"),
+          file.path(output_dir, "Final_selection_plot_objects.rds"))
+  if (!identical(unname(source_hashes), unname(tools::md5sum(paths))))
+    fail("运行期间输入文件发生改变，请不要使用此次输出。")
+  audit <- c("PASS: raw MIMIC-IV file hash matches original analysis.",
+             if (has_raw_ids) "PASS: saved training patient/stay identities and split membership match." else
+               "PASS: saved training source-row identities and split membership match; patient/stay IDs were unavailable.",
+             paste("Training records:", nrow(x)), paste("Candidate predictors:", length(candidate_features)),
+             paste("Available predictors after training-only missingness/constant checks:", ncol(x)),
+             "PASS: training-only median/mode values independently reproduced; saved fills used.",
+             "PASS: final model input and outcomes match dev.csv.",
+             "PASS: saved auxiliary CV and lambda.min selection retained without retuning; 1-SE line is a reference only.",
+             "PASS: LASSO selected lambda and complete predictor list match original result.",
+             "PASS: all Boruta decisions and complete predictor list match original result.",
+             sprintf("PASS: Boruta=%d, LASSO=%d, intersection=%d (complete names verified).", length(boruta_names), length(lasso_names), length(selected)),
+             paste("Final predictors:", paste(selected, collapse = ", ")),
+             paste("Full-training log(lambda_min):", format(log(pp$lambda), digits = 15)),
+             paste("Selected lambda/lambda_max:", format(pp$lambda_ratio, digits = 15)),
+             paste("Boruta seed:", pp$seed), paste("Boruta maximum runs:", cfg$boruta_max_runs),
+             paste("Boruta history rows:", nrow(bo$ImpHistory)),
+             "The original Boruta importance history was not saved; these boxes reconstruct it under matching software/settings and decisions.",
+             "No new CV was run. The saved auxiliary-CV means and SEs are plotted; top counts are from the full-training coefficient path.",
+             "The CV penalty grid was relative lambda/lambda_max, estimated with fold-specific lambda_max.",
+             paste("Plot x-axis:", x_axis),
+             "Reference-lambda mode is a coordinate mapping using the full-training lambda_max, not a common absolute lambda across CV folds.",
+             "No final nine-algorithm prediction model, classification threshold or performance result was refitted/changed.",
+             "PASS: original input files were not modified.")
+  writeLines(audit, file.path(output_dir, "Replot_consistency_audit.txt"))
+  caption <- c(
+    paste0("Figure 3. Predictor selection for the final model refits using the full MIMIC-IV development training set (n = ", nrow(x), ")."),
+    paste0("(A) LASSO coefficient paths. (B) Mean binomial deviance with plus/minus one standard error from the saved ", cfg$lasso_folds, "-fold auxiliary cross-validation used for LASSO penalty selection. The red line marks the minimum mean deviance, which was used for selection (lambda.min); the blue line marks the one-standard-error reference, which was not used for selection. Numbers along the upper axes indicate nonzero predictor coefficients in the full-training fit, excluding the intercept; they are not fold-specific selection frequencies."),
+    if (x_axis == "reference_lambda") "The LASSO search used lambda/lambda_max with lambda_max estimated in each auxiliary training fold. For consistency with the original display, the horizontal axes show log(lambda) mapped to the full-training lambda_max reference scale; these are not identical absolute penalties across auxiliary folds." else
+      "The horizontal axes show log(lambda/lambda_max), where lambda_max was estimated within the relevant training subset.",
+    if (confirmed_only) sprintf("(C) Reconstructed Boruta importance distributions for the %d confirmed predictors and the shadow-feature references. Rejected predictors are omitted from this display, and complete decisions are supplied in the accompanying table.", length(boruta_names)) else
+      "(C) Reconstructed Boruta importance distributions and decisions for available predictors and shadow-feature references. Variables excluded before Boruta are listed in the accompanying table.",
+    sprintf("(D) Overlap between the %d predictors retained by LASSO at lambda.min and the %d predictors confirmed by Boruta, yielding %d predictors for the final model refits.", length(lasso_names), length(boruta_names), length(selected)),
+    "These panels illustrate the final training-set selection. Imputation and feature selection were separately repeated within training folds during nested cross-validation; not every fold selected the same predictor set.")
+  if (!draw_venn) caption <- caption[!grepl("^\\(D\\)", caption)]
+  writeLines(caption, file.path(output_dir, "Figure3_caption_English.txt"))
+  message("补图完成：", output_dir)
+  message("请检查Replot_consistency_audit.txt中的PASS记录。原模型、阈值和性能结果未改变。")
+  invisible(list(output_dir = output_dir, lasso = lasso_names, boruta = boruta_names,
+                 features = selected, n_training = nrow(x), input_hashes = source_hashes))
+}
+LAMBDA_MIN_REPLOT_RESULT <- redraw_lambda_min_selection(
+  result_dir = RESULT_DIR, raw_file = RAW_MIMIC4_FILE, output_dir = PLOT_OUTPUT_DIR,
+  draw_venn = DRAW_VENN, confirmed_only = BORUTA_CONFIRMED_ONLY,
+  x_axis = LASSO_X_AXIS, text_scale = TEXT_SCALE,
+  boruta_width = BORUTA_WIDTH, boruta_height = BORUTA_HEIGHT,
+  lasso1_width = LASSO1_WIDTH, lasso1_height = LASSO1_HEIGHT,
+  lasso2_width = LASSO2_WIDTH, lasso2_height = LASSO2_HEIGHT
+)
